@@ -1,7 +1,7 @@
 /* mcc - micro C compiler for Linux x86-64. No libc.
  * Build:  gcc -static -nostdlib -ffreestanding -fno-stack-protector -O1 -o mcc mcc.c
  * Use:    ./mcc in.c [out]    (out defaults to a.out)
- * Reads:  int main() { puts("..."); return N; }
+ * Reads:  int main() { puts("..."); return <expression>; }
  */
 typedef unsigned long u64;
 typedef unsigned int u32;
@@ -51,6 +51,53 @@ static void exit_with(u32 code_) {
     emit(0x0f); emit(0x05);             /* syscall */
 }
 
+/* exit with whatever is in eax */
+static void exit_eax(void) {
+    emit(0x89); emit(0xc7);             /* edi = eax */
+    emit(0xb8); emit32(60);             /* eax = 60 (exit) */
+    emit(0x0f); emit(0x05);             /* syscall */
+}
+
+/* Expressions. Every function leaves its answer in eax.
+ * For "a op b": work out a, push it, work out b, move b to ecx, pop a, do the op. */
+static void expr(void);
+
+static void factor(void) {
+    ws();
+    if (eat("(")) { expr(); expect(")"); }
+    else if (eat("-")) { factor(); emit(0xf7); emit(0xd8); }       /* neg eax */
+    else if (*p >= '0' && *p <= '9') {
+        u32 v = 0;
+        while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+        emit(0xb8); emit32(v);                                      /* eax = number */
+    } else die("expected expression", 0);
+}
+
+static void term(void) {
+    factor();
+    for (;;) {
+        int op;
+        if (eat("*")) op = 0; else if (eat("/")) op = 1; else if (eat("%")) op = 2; else return;
+        emit(0x50); factor(); emit(0x89); emit(0xc1); emit(0x58);   /* push, right side, ecx = eax, pop */
+        if (op == 0) { emit(0x0f); emit(0xaf); emit(0xc1); }        /* imul eax, ecx */
+        else {
+            emit(0x99); emit(0xf7); emit(0xf9);                     /* cdq, idiv ecx */
+            if (op == 2) { emit(0x89); emit(0xd0); }                /* remainder: eax = edx */
+        }
+    }
+}
+
+static void expr(void) {
+    term();
+    for (;;) {
+        int sub;
+        if (eat("+")) sub = 0; else if (eat("-")) sub = 1; else return;
+        emit(0x50); term(); emit(0x89); emit(0xc1); emit(0x58);     /* push, right side, ecx = eax, pop */
+        if (sub) { emit(0x29); emit(0xc8); }                        /* sub eax, ecx */
+        else { emit(0x01); emit(0xc8); }                            /* add eax, ecx */
+    }
+}
+
 static void stmt(void) {
     if (eat("puts")) {
         expect("("); expect("\"");
@@ -73,12 +120,9 @@ static void stmt(void) {
         emit(0xba); emit32(nd - start); /* edx = length */
         emit(0x0f); emit(0x05);         /* syscall */
     } else if (eat("return")) {
-        ws();
-        u32 v = 0; int any = 0;
-        while (*p >= '0' && *p <= '9') { v = v * 10 + (*p++ - '0'); any = 1; }
-        if (!any) die("expected number after return", 0);
+        expr();
         expect(";");
-        exit_with(v);
+        exit_eax();
     } else die("unsupported statement", 0);
 }
 
