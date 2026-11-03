@@ -3,4 +3,6 @@
 !*.c
 !*.h
 !*.md
+!*.sh
+!LICENSE
 !.gitignore

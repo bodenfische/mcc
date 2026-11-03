@@ -1,7 +1,7 @@
 /* mcc - micro C compiler for Linux x86-64. No libc.
  * Build:  gcc -static -nostdlib -ffreestanding -fno-stack-protector -O1 -o mcc mcc.c
  * Use:    ./mcc in.c [out]    (out defaults to a.out)
- * Reads:  int main() { puts("..."); return <expression>; }
+ * Reads:  int main() { puts("..."); putn(<expression>); return <expression>; }
  */
 typedef unsigned long u64;
 typedef unsigned int u32;
@@ -18,6 +18,8 @@ static char src[65536];
 static u8 code[4096], data[4096], out[16384];
 static int nc, nd, no, np;
 static u32 patch_at[64], patch_str[64];
+static u32 call_at[64];
+static int ncall;
 static char *p;
 
 static long slen(char *s) { long n = 0; while (s[n]) n++; return n; }
@@ -50,6 +52,40 @@ static void exit_with(u32 code_) {
     emit(0xb8); emit32(60);             /* eax = 60 (exit) */
     emit(0x0f); emit(0x05);             /* syscall */
 }
+
+/* Machine code for putn: prints the number in eax, then a newline.
+ * It is added to the end of the program once, and every putn(...) calls it. */
+static u8 putn_code[] = {
+    0x48,0x83,0xec,0x10,             /* make a 16 byte buffer on the stack */
+    0x48,0x8d,0x7c,0x24,0x0f,        /* rdi = last byte of the buffer */
+    0xc6,0x07,0x0a,                  /* put a newline there */
+    0x31,0xf6,                       /* esi = 0 (will be 1 if negative) */
+    0x85,0xc0,                       /* if eax is negative: */
+    0x79,0x04,
+    0xf7,0xd8,                       /*   eax = -eax */
+    0xff,0xc6,                       /*   esi = 1 */
+    0xb9,0x0a,0x00,0x00,0x00,        /* ecx = 10 */
+    /* loop: one digit each time, working from the right */
+    0x31,0xd2,                       /* edx = 0 */
+    0xf7,0xf1,                       /* eax = eax / 10, edx = remainder */
+    0x80,0xc2,0x30,                  /* dl = dl + '0' */
+    0x48,0xff,0xcf,                  /* rdi = rdi - 1 */
+    0x88,0x17,                       /* store the digit */
+    0x85,0xc0,                       /* go round again until eax is 0 */
+    0x75,0xf0,
+    0x85,0xf6,                       /* if it was negative: */
+    0x74,0x06,
+    0x48,0xff,0xcf,                  /*   rdi = rdi - 1 */
+    0xc6,0x07,0x2d,                  /*   store '-' */
+    0x48,0x8d,0x54,0x24,0x10,        /* rdx = end of the buffer */
+    0x48,0x29,0xfa,                  /* rdx = rdx - rdi (the length) */
+    0x48,0x89,0xfe,                  /* rsi = rdi (the start) */
+    0xbf,0x01,0x00,0x00,0x00,        /* edi = 1 (stdout) */
+    0xb8,0x01,0x00,0x00,0x00,        /* eax = 1 (write) */
+    0x0f,0x05,                       /* syscall */
+    0x48,0x83,0xc4,0x10,             /* give the buffer back */
+    0xc3,                            /* return */
+};
 
 /* exit with whatever is in eax */
 static void exit_eax(void) {
@@ -119,6 +155,10 @@ static void stmt(void) {
         emit(0xbe); patch_at[np] = nc; patch_str[np++] = start; emit32(0); /* esi = text address, filled in later */
         emit(0xba); emit32(nd - start); /* edx = length */
         emit(0x0f); emit(0x05);         /* syscall */
+    } else if (eat("putn")) {
+        expect("("); expr(); expect(")"); expect(";");
+        if (ncall == 64) die("too many putn calls", 0);
+        emit(0xe8); call_at[ncall++] = nc; emit32(0);   /* call putn, address filled in later */
     } else if (eat("return")) {
         expr();
         expect(";");
@@ -138,6 +178,15 @@ static int qmain(int argc, char **argv) {
     expect("int"); expect("main"); expect("("); eat("void"); expect(")"); expect("{");
     while (!eat("}")) stmt();
     exit_with(0);
+
+    if (ncall) {                        /* add putn after the program, then fix the calls */
+        int at = nc;
+        for (int i = 0; i < (int)sizeof putn_code; i++) emit(putn_code[i]);
+        for (int i = 0; i < ncall; i++) {
+            u32 rel = at - (call_at[i] + 4);
+            for (int k = 0; k < 4; k++) code[call_at[i] + k] = rel >> (8 * k);
+        }
+    }
 
     u64 base = 0x400000, hdr = 64 + 56;
     u64 dataaddr = base + hdr + nc;
