@@ -1,7 +1,7 @@
 /* mcc - micro C compiler for Linux x86-64. No libc.
  * Build:  gcc -static -nostdlib -ffreestanding -fno-stack-protector -O1 -o mcc mcc.c
  * Use:    ./mcc in.c [out]    (out defaults to a.out)
- * Reads:  int main() { puts("..."); putn(<expression>); return <expression>; }
+ * Reads:  int main() { int x = 1; x = x + 1; puts("..."); putn(x); return x; }
  */
 typedef unsigned long u64;
 typedef unsigned int u32;
@@ -20,6 +20,12 @@ static int nc, nd, no, np;
 static u32 patch_at[64], patch_str[64];
 static u32 call_at[64];
 static int ncall;
+
+/* Local variables. Each one is a 4 byte int on the stack, found by its
+ * position in this table: variable 0 is at [rbp-4], variable 1 at [rbp-8]... */
+static char vname[64][32];
+static int nvar;
+static char name[32];                   /* the name just read by ident() */
 static char *p;
 
 static long slen(char *s) { long n = 0; while (s[n]) n++; return n; }
@@ -46,6 +52,37 @@ static int eat(char *s) {
     return 1;
 }
 static void expect(char *s) { if (!eat(s)) die("expected", s); }
+
+/* read a name (letters, digits, _) into name[] */
+static void ident(void) {
+    ws();
+    int n = 0;
+    if (!isw(*p) || (*p >= '0' && *p <= '9')) die("expected a name", 0);
+    while (isw(*p)) {
+        if (n == 31) die("name too long", 0);
+        name[n++] = *p++;
+    }
+    name[n] = 0;
+}
+
+/* which variable is name[]? returns -1 if there isn't one */
+static int find(void) {
+    for (int i = 0; i < nvar; i++) {
+        int j = 0;
+        while (vname[i][j] == name[j] && name[j]) j++;
+        if (vname[i][j] == name[j]) return i;
+    }
+    return -1;
+}
+
+static int lookup(void) {
+    int i = find();
+    if (i < 0) die("undeclared", name);
+    return i;
+}
+
+static void load(int i)  { emit(0x8b); emit(0x85); emit32(-4 * (i + 1)); }   /* eax = variable */
+static void store(int i) { emit(0x89); emit(0x85); emit32(-4 * (i + 1)); }   /* variable = eax */
 
 static void exit_with(u32 code_) {
     emit(0xbf); emit32(code_);          /* edi = exit code */
@@ -106,7 +143,8 @@ static void factor(void) {
         u32 v = 0;
         while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
         emit(0xb8); emit32(v);                                      /* eax = number */
-    } else die("expected expression", 0);
+    } else if (isw(*p)) { ident(); load(lookup()); }
+    else die("expected expression", 0);
 }
 
 static void term(void) {
@@ -163,7 +201,22 @@ static void stmt(void) {
         expr();
         expect(";");
         exit_eax();
-    } else die("unsupported statement", 0);
+    } else if (eat("int")) {            /* int x;  or  int x = <expression>; */
+        ident();
+        if (find() >= 0) die("already declared", name);
+        if (nvar == 64) die("too many variables", 0);
+        int i = nvar++;
+        for (int j = 0; j < 32; j++) vname[i][j] = name[j];
+        if (eat("=")) { expr(); store(i); }             /* no value given: slot is left as it is, like C */
+        expect(";");
+    } else {
+        ws();
+        if (!isw(*p)) die("unsupported statement", 0);
+        ident();                        /* x = <expression>; */
+        int i = lookup();
+        expect("="); expr(); expect(";");
+        store(i);
+    }
 }
 
 static int qmain(int argc, char **argv) {
@@ -176,8 +229,14 @@ static int qmain(int argc, char **argv) {
     p = src;
 
     expect("int"); expect("main"); expect("("); eat("void"); expect(")"); expect("{");
+    emit(0x55);                                         /* push rbp */
+    emit(0x48); emit(0x89); emit(0xe5);                 /* rbp = rsp (variables live below this) */
+    emit(0x48); emit(0x81); emit(0xec);                 /* rsp = rsp - space for variables */
+    int frame_at = nc; emit32(0);                       /* size filled in once we know it */
     while (!eat("}")) stmt();
     exit_with(0);
+    u32 frame = (nvar * 4 + 15) & ~15;                  /* round up to a multiple of 16 */
+    for (int k = 0; k < 4; k++) code[frame_at + k] = frame >> (8 * k);
 
     if (ncall) {                        /* add putn after the program, then fix the calls */
         int at = nc;
