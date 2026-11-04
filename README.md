@@ -9,6 +9,8 @@ Currently compiles `int main() { ... }` containing:
 
     int x = 5;  int y;  x = x + 1;   // int variables only
     puts("...");  putn(<expression>);  return <expression>;
+    if (<expression>) <statement>  else <statement>
+    { <statements> }               // a block, variables inside stay inside
 
 Expressions: numbers, variables, `+ - * / %`, `== != < > <= >=` (give 1 or 0), brackets, unary minus.
 

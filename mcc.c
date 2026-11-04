@@ -1,7 +1,7 @@
 /* mcc - micro C compiler for Linux x86-64. No libc.
  * Build:  gcc -static -nostdlib -ffreestanding -fno-stack-protector -O1 -o mcc mcc.c
  * Use:    ./mcc in.c [out]    (out defaults to a.out)
- * Reads:  int main() { int x = 1; x = x + 1; puts("..."); putn(x < 5); return x; }
+ * Reads:  int main() { int x = 1; if (x < 5) { putn(x); } else puts("big"); return x; }
  */
 typedef unsigned long u64;
 typedef unsigned int u32;
@@ -23,9 +23,14 @@ static int ncall;
 
 /* Local variables live on the stack, 4 bytes each: the first at [rbp-4], the
  * second at [rbp-8], and so on. A variable's position in this table is all that's
- * needed to find it again. vname holds the names, nvar says how many there are. */
+ * needed to find it again. vname holds the names, nvar says how many there are.
+ *
+ * A { } block gets its own scope: variables declared inside it vanish at the
+ * closing brace, and their stack slots get reused. scope is the first variable
+ * that belongs to the current block, and maxvar is the most variables alive at
+ * once, which decides how much stack space the function needs. */
 static char vname[64][32];
-static int nvar;
+static int nvar, scope, maxvar;
 static char name[32];                   /* the name ident() just read */
 static char *p;
 
@@ -66,9 +71,11 @@ static void ident(void) {
     name[n] = 0;
 }
 
-/* Look name[] up in the variable table. Gives its number, or -1 if it isn't there. */
-static int find(void) {
-    for (int i = 0; i < nvar; i++) {
+/* Look name[] up in the variable table, newest first so an inner variable hides an
+ * outer one of the same name. Variables before number lo are ignored. Gives the
+ * variable's number, or -1 if it isn't there. */
+static int find(int lo) {
+    for (int i = nvar - 1; i >= lo; i--) {
         int j = 0;
         while (vname[i][j] == name[j] && name[j]) j++;
         if (vname[i][j] == name[j]) return i;
@@ -78,7 +85,7 @@ static int find(void) {
 
 /* Same, but a missing variable is an error. */
 static int lookup(void) {
-    int i = find();
+    int i = find(0);
     if (i < 0) die("undeclared", name);
     return i;
 }
@@ -208,6 +215,16 @@ static void expr(void) {
     }
 }
 
+/* Jumps. How far to jump isn't known until the code being skipped has been
+ * written, so these leave the distance blank and hand back where it is. Once the
+ * code to skip is done, here() goes back and fills the distance in. */
+static int jump_if_zero(void) { emit(0x0f); emit(0x84); emit32(0); return nc - 4; }
+static int jump(void) { emit(0xe9); emit32(0); return nc - 4; }
+static void here(int at) {
+    u32 rel = nc - (at + 4);            /* distances count from the end of the jump instruction */
+    for (int k = 0; k < 4; k++) code[at + k] = rel >> (8 * k);
+}
+
 static void stmt(void) {
     if (eat("puts")) {
         expect("("); expect("\"");
@@ -237,14 +254,38 @@ static void stmt(void) {
         expr();
         expect(";");
         exit_eax();
+    } else if (eat("{")) {
+        /* { ... } a block: any number of statements. Variables declared inside
+         * are forgotten at the closing brace. */
+        int saved = nvar, outer = scope;
+        scope = nvar;
+        while (!eat("}")) stmt();
+        nvar = saved; scope = outer;
+    } else if (eat("if")) {
+        /* if (condition) statement   or   if (condition) statement else statement
+         * Zero counts as false and anything else as true. The code tests eax and
+         * jumps over the "if" part when it's zero. With an "else", the "if" part
+         * ends with a second jump that skips over the "else" part. */
+        expect("("); expr(); expect(")");
+        emit(0x85); emit(0xc0);                         /* is eax zero? */
+        int skip = jump_if_zero();
+        stmt();
+        if (eat("else")) {
+            int end = jump();
+            here(skip);                                 /* a false condition lands here, on the else part */
+            stmt();
+            here(end);
+        } else here(skip);
     } else if (eat("int")) {
         /* int x;  or  int x = <expression>;
          * Reserve a slot for the name. "int x;" on its own makes no code, so the
-         * slot keeps whatever was there before, like in C. */
+         * slot keeps whatever was there before, like in C. A name can only clash
+         * with one from the same block, so an inner block may reuse an outer name. */
         ident();
-        if (find() >= 0) die("already declared", name);
+        if (find(scope) >= 0) die("already declared", name);
         if (nvar == 64) die("too many variables", 0);
         int i = nvar++;
+        if (nvar > maxvar) maxvar = nvar;
         for (int j = 0; j < 32; j++) vname[i][j] = name[j];
         if (eat("=")) { expr(); store(i); }
         expect(";");
@@ -278,7 +319,7 @@ static int qmain(int argc, char **argv) {
     int frame_at = nc; emit32(0);                       /* the amount, filled in below */
     while (!eat("}")) stmt();
     exit_with(0);
-    u32 frame = (nvar * 4 + 15) & ~15;                  /* 4 bytes each, rounded up to a multiple of 16 */
+    u32 frame = (maxvar * 4 + 15) & ~15;                /* 4 bytes each, rounded up to a multiple of 16 */
     for (int k = 0; k < 4; k++) code[frame_at + k] = frame >> (8 * k);
 
     if (ncall) {                        /* add putn after the program, then fix the calls */
