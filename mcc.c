@@ -1,7 +1,7 @@
 /* mcc - micro C compiler for Linux x86-64. No libc.
  * Build:  gcc -static -nostdlib -ffreestanding -fno-stack-protector -O1 -o mcc mcc.c
  * Use:    ./mcc in.c [out]    (out defaults to a.out)
- * Reads:  int main() { int x = 1; x = x + 1; puts("..."); putn(x); return x; }
+ * Reads:  int main() { int x = 1; x = x + 1; puts("..."); putn(x < 5); return x; }
  */
 typedef unsigned long u64;
 typedef unsigned int u32;
@@ -21,11 +21,12 @@ static u32 patch_at[64], patch_str[64];
 static u32 call_at[64];
 static int ncall;
 
-/* Local variables. Each one is a 4 byte int on the stack, found by its
- * position in this table: variable 0 is at [rbp-4], variable 1 at [rbp-8]... */
+/* Local variables live on the stack, 4 bytes each: the first at [rbp-4], the
+ * second at [rbp-8], and so on. A variable's position in this table is all that's
+ * needed to find it again. vname holds the names, nvar says how many there are. */
 static char vname[64][32];
 static int nvar;
-static char name[32];                   /* the name just read by ident() */
+static char name[32];                   /* the name ident() just read */
 static char *p;
 
 static long slen(char *s) { long n = 0; while (s[n]) n++; return n; }
@@ -53,7 +54,7 @@ static int eat(char *s) {
 }
 static void expect(char *s) { if (!eat(s)) die("expected", s); }
 
-/* read a name (letters, digits, _) into name[] */
+/* Read a name from the source into name[]. */
 static void ident(void) {
     ws();
     int n = 0;
@@ -65,7 +66,7 @@ static void ident(void) {
     name[n] = 0;
 }
 
-/* which variable is name[]? returns -1 if there isn't one */
+/* Look name[] up in the variable table. Gives its number, or -1 if it isn't there. */
 static int find(void) {
     for (int i = 0; i < nvar; i++) {
         int j = 0;
@@ -75,14 +76,16 @@ static int find(void) {
     return -1;
 }
 
+/* Same, but a missing variable is an error. */
 static int lookup(void) {
     int i = find();
     if (i < 0) die("undeclared", name);
     return i;
 }
 
-static void load(int i)  { emit(0x8b); emit(0x85); emit32(-4 * (i + 1)); }   /* eax = variable */
-static void store(int i) { emit(0x89); emit(0x85); emit32(-4 * (i + 1)); }   /* variable = eax */
+/* Variable number i sits at [rbp - 4*(i+1)]. These copy it into eax and back. */
+static void load(int i)  { emit(0x8b); emit(0x85); emit32(-4 * (i + 1)); }   /* eax = the variable */
+static void store(int i) { emit(0x89); emit(0x85); emit32(-4 * (i + 1)); }   /* the variable = eax */
 
 static void exit_with(u32 code_) {
     emit(0xbf); emit32(code_);          /* edi = exit code */
@@ -143,7 +146,7 @@ static void factor(void) {
         u32 v = 0;
         while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
         emit(0xb8); emit32(v);                                      /* eax = number */
-    } else if (isw(*p)) { ident(); load(lookup()); }
+    } else if (isw(*p)) { ident(); load(lookup()); }                /* a variable */
     else die("expected expression", 0);
 }
 
@@ -161,7 +164,7 @@ static void term(void) {
     }
 }
 
-static void expr(void) {
+static void sum(void) {                 /* + and - */
     term();
     for (;;) {
         int sub;
@@ -169,6 +172,39 @@ static void expr(void) {
         emit(0x50); term(); emit(0x89); emit(0xc1); emit(0x58);     /* push, right side, ecx = eax, pop */
         if (sub) { emit(0x29); emit(0xc8); }                        /* sub eax, ecx */
         else { emit(0x01); emit(0xc8); }                            /* add eax, ecx */
+    }
+}
+
+/* Comparisons give 1 for true and 0 for false, like C. They work the same way as
+ * + and -, except for the last step: compare eax with ecx, then set eax to 1 or 0
+ * depending on the result. setcc picks which test to use (equal, less than...). */
+static void compare(int setcc) {
+    emit(0x39); emit(0xc8);             /* compare eax with ecx */
+    emit(0x0f); emit(setcc); emit(0xc0);/* al = 1 if the test passed, otherwise 0 */
+    emit(0x0f); emit(0xb6); emit(0xc0); /* eax = al, so the rest of eax is 0 */
+}
+
+/* < > <= >= bind tighter than == and !=, same as in C. The two character ones
+ * are checked first, otherwise "<" would grab the front of "<=". */
+static void relation(void) {
+    sum();
+    for (;;) {
+        int cc;
+        if (eat("<=")) cc = 0x9e; else if (eat(">=")) cc = 0x9d;
+        else if (eat("<")) cc = 0x9c; else if (eat(">")) cc = 0x9f; else return;
+        emit(0x50); sum(); emit(0x89); emit(0xc1); emit(0x58);      /* push, right side, ecx = eax, pop */
+        compare(cc);
+    }
+}
+
+/* == and != are the loosest, so this is the top: a whole expression. */
+static void expr(void) {
+    relation();
+    for (;;) {
+        int cc;
+        if (eat("==")) cc = 0x94; else if (eat("!=")) cc = 0x95; else return;
+        emit(0x50); relation(); emit(0x89); emit(0xc1); emit(0x58);
+        compare(cc);
     }
 }
 
@@ -201,18 +237,22 @@ static void stmt(void) {
         expr();
         expect(";");
         exit_eax();
-    } else if (eat("int")) {            /* int x;  or  int x = <expression>; */
+    } else if (eat("int")) {
+        /* int x;  or  int x = <expression>;
+         * Reserve a slot for the name. "int x;" on its own makes no code, so the
+         * slot keeps whatever was there before, like in C. */
         ident();
         if (find() >= 0) die("already declared", name);
         if (nvar == 64) die("too many variables", 0);
         int i = nvar++;
         for (int j = 0; j < 32; j++) vname[i][j] = name[j];
-        if (eat("=")) { expr(); store(i); }             /* no value given: slot is left as it is, like C */
+        if (eat("=")) { expr(); store(i); }
         expect(";");
     } else {
+        /* x = <expression>;  Work out the value and save it into x. */
         ws();
         if (!isw(*p)) die("unsupported statement", 0);
-        ident();                        /* x = <expression>; */
+        ident();
         int i = lookup();
         expect("="); expr(); expect(";");
         store(i);
@@ -228,14 +268,17 @@ static int qmain(int argc, char **argv) {
     src[n] = 0;
     p = src;
 
+    /* Start of main: make room on the stack for the variables. The number of them
+     * isn't known until the whole function has been read, so the amount is left
+     * blank here and filled in afterwards. */
     expect("int"); expect("main"); expect("("); eat("void"); expect(")"); expect("{");
-    emit(0x55);                                         /* push rbp */
-    emit(0x48); emit(0x89); emit(0xe5);                 /* rbp = rsp (variables live below this) */
-    emit(0x48); emit(0x81); emit(0xec);                 /* rsp = rsp - space for variables */
-    int frame_at = nc; emit32(0);                       /* size filled in once we know it */
+    emit(0x55);                                         /* save rbp */
+    emit(0x48); emit(0x89); emit(0xe5);                 /* rbp = rsp, so variables can be found relative to rbp */
+    emit(0x48); emit(0x81); emit(0xec);                 /* move rsp down to make room for them */
+    int frame_at = nc; emit32(0);                       /* the amount, filled in below */
     while (!eat("}")) stmt();
     exit_with(0);
-    u32 frame = (nvar * 4 + 15) & ~15;                  /* round up to a multiple of 16 */
+    u32 frame = (nvar * 4 + 15) & ~15;                  /* 4 bytes each, rounded up to a multiple of 16 */
     for (int k = 0; k < 4; k++) code[frame_at + k] = frame >> (8 * k);
 
     if (ncall) {                        /* add putn after the program, then fix the calls */

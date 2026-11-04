@@ -10,6 +10,6 @@ Currently compiles `int main() { ... }` containing:
     int x = 5;  int y;  x = x + 1;   // int variables only
     puts("...");  putn(<expression>);  return <expression>;
 
-Expressions: numbers, variables, `+ - * / %`, brackets, unary minus.
+Expressions: numbers, variables, `+ - * / %`, `== != < > <= >=` (give 1 or 0), brackets, unary minus.
 
     sh tests/run.sh    # builds mcc with gcc, runs the tests
