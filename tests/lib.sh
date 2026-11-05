@@ -12,12 +12,17 @@ trap 'rm -rf "$tmp"' EXIT
 pass=0
 fail=0
 
+# run a test program, giving up after 5 seconds in case a loop never ends
+run() {
+    if command -v timeout >/dev/null 2>&1; then timeout 5 "$@"; else "$@"; fi
+}
+
 # check NAME EXPECTED-OUTPUT FILE.c
 check() {
     ok=1
-    ./mcc "$3" "$tmp/t" && [ "$("$tmp/t")" = "$2" ] || ok=0
+    ./mcc "$3" "$tmp/t" && [ "$(run "$tmp/t")" = "$2" ] || ok=0
     gcc -w -include stdio.h '-Dputn(x)=printf("%d\n",(x))' -o "$tmp/g" "$3" \
-        && [ "$("$tmp/g")" = "$2" ] || ok=0
+        && [ "$(run "$tmp/g")" = "$2" ] || ok=0
     if [ "$ok" = 1 ]; then
         echo "ok   $1"; pass=$((pass + 1))
     else

@@ -16,5 +16,8 @@ fails else-alone        'if (1) else putn(1);'
 fails block-unclosed    'if (1) { putn(1);'
 fails block-redeclare   'if (1) { int x; int x; }'
 fails block-var-escapes 'if (1) { int y = 1; } putn(y);'
+fails while-no-brackets 'while 1 putn(1);'
+fails while-unclosed     'while (1 putn(1);'
+fails while-no-condition 'while () putn(1);'
 
 finish

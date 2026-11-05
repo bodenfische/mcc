@@ -1,7 +1,7 @@
 /* mcc - micro C compiler for Linux x86-64. No libc.
  * Build:  gcc -static -nostdlib -ffreestanding -fno-stack-protector -O1 -o mcc mcc.c
  * Use:    ./mcc in.c [out]    (out defaults to a.out)
- * Reads:  int main() { int x = 1; if (x < 5) { putn(x); } else puts("big"); return x; }
+ * Reads:  int main() { int i = 0; while (i < 3) { putn(i); i = i + 1; } return i; }
  */
 typedef unsigned long u64;
 typedef unsigned int u32;
@@ -220,6 +220,10 @@ static void expr(void) {
  * code to skip is done, here() goes back and fills the distance in. */
 static int jump_if_zero(void) { emit(0x0f); emit(0x84); emit32(0); return nc - 4; }
 static int jump(void) { emit(0xe9); emit32(0); return nc - 4; }
+static void jump_back(int target) {     /* a jump to code that's already been written */
+    emit(0xe9);
+    emit32(target - (nc + 4));
+}
 static void here(int at) {
     u32 rel = nc - (at + 4);            /* distances count from the end of the jump instruction */
     for (int k = 0; k < 4; k++) code[at + k] = rel >> (8 * k);
@@ -276,6 +280,18 @@ static void stmt(void) {
             stmt();
             here(end);
         } else here(skip);
+    } else if (eat("while")) {
+        /* while (condition) statement
+         * Same as an "if", except the end of the body jumps back up to the
+         * condition, so it gets tested again. When the condition finally comes
+         * out as zero, the jump at the top skips past the whole loop. */
+        int top = nc;
+        expect("("); expr(); expect(")");
+        emit(0x85); emit(0xc0);                         /* is eax zero? */
+        int skip = jump_if_zero();
+        stmt();
+        jump_back(top);
+        here(skip);
     } else if (eat("int")) {
         /* int x;  or  int x = <expression>;
          * Reserve a slot for the name. "int x;" on its own makes no code, so the
