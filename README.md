@@ -13,6 +13,8 @@ Currently compiles `int main() { ... }` containing:
     while (<expression>) <statement>
     { <statements> }               // a block, variables inside stay inside
 
+`//` and `/* */` comments work anywhere.
+
 Expressions: numbers, variables, `+ - * / %`, `== != < > <= >=` (give 1 or 0), brackets, unary minus.
 
     sh tests/run.sh    # builds mcc with gcc, runs the tests

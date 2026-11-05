@@ -45,7 +45,21 @@ static void emit(int b) { code[nc++] = b; }
 static void emit32(u32 v) { for (int i = 0; i < 4; i++) emit(v >> (8 * i)); }
 static void o(u64 v, int n) { for (int i = 0; i < n; i++) out[no++] = v >> (8 * i); }
 
-static void ws(void) { while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') p++; }
+/* Skip spaces, newlines and comments (// to the end of the line, and block
+ * comments). A comment counts as whitespace, so nothing else needs to know about them. */
+static void ws(void) {
+    for (;;) {
+        if (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') p++;
+        else if (p[0] == '/' && p[1] == '/') { while (*p && *p != '\n') p++; }
+        else if (p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+            if (!*p) die("unterminated comment", 0);
+            p += 2;
+        }
+        else return;
+    }
+}
 static int isw(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
 }
