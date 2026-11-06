@@ -119,6 +119,28 @@ static int lookup(void) {
 static void load(int i)  { emit(0x8b); emit(0x85); emit32(-4 * (i + 1)); }   /* eax = the variable */
 static void store(int i) { emit(0x89); emit(0x85); emit32(-4 * (i + 1)); }   /* the variable = eax */
 
+/* ++ and -- change the variable in memory directly, leaving eax alone. */
+static void add_const(int i, int amount) {                                   /* the variable += amount (1 or -1) */
+    emit(0x83); emit(0x85); emit32(-4 * (i + 1)); emit(amount & 0xff);
+}
+
+/* The compound assignments: variable = variable op eax, where op is one of + - * / % */
+static void modify(int i, int op) {
+    int off = -4 * (i + 1);
+    if (op == '+') { emit(0x01); emit(0x85); emit32(off); }                  /* add [variable], eax */
+    else if (op == '-') { emit(0x29); emit(0x85); emit32(off); }             /* sub [variable], eax */
+    else if (op == '*') {
+        emit(0x0f); emit(0xaf); emit(0x85); emit32(off);                     /* eax = eax * variable */
+        store(i);
+    } else {                                                                 /* / and %: the variable is the dividend */
+        emit(0x89); emit(0xc1);                                              /* ecx = eax, the divisor */
+        load(i);
+        emit(0x99); emit(0xf7); emit(0xf9);                                  /* cdq, idiv ecx */
+        if (op == '%') { emit(0x89); emit(0xd0); }                           /* remainder: eax = edx */
+        store(i);
+    }
+}
+
 static void exit_with(u32 code_) {
     emit(0xbf); emit32(code_);          /* edi = exit code */
     emit(0xb8); emit32(60);             /* eax = 60 (exit) */
@@ -173,7 +195,9 @@ static void expr(void);
 static void factor(void) {
     ws();
     if (eat("(")) { expr(); expect(")"); }
-    else if (eat("-")) { factor(); emit(0xf7); emit(0xd8); }       /* neg eax */
+    else if (eat("++")) { ident(); int i = lookup(); add_const(i, 1); load(i); }    /* ++x: the new value */
+    else if (eat("--")) { ident(); int i = lookup(); add_const(i, -1); load(i); }
+    else if (eat("-")) { factor(); emit(0xf7); emit(0xd8); }       /* neg eax (after -- so "--x" isn't read as two minuses) */
     else if (eat("!")) {                                            /* 1 if it was zero, otherwise 0 */
         factor();
         emit(0x85); emit(0xc0);                                     /* is eax zero? */
@@ -184,7 +208,12 @@ static void factor(void) {
         u32 v = 0;
         while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
         emit(0xb8); emit32(v);                                      /* eax = number */
-    } else if (isw(*p)) { ident(); load(lookup()); }                /* a variable */
+    } else if (isw(*p)) {                                           /* a variable, maybe with x++ or x-- */
+        ident();
+        int i = lookup();
+        load(i);                                                    /* eax = the old value, which x++ gives back */
+        if (eat("++")) add_const(i, 1); else if (eat("--")) add_const(i, -1);
+    }
     else die("expected expression", 0);
 }
 
@@ -380,13 +409,26 @@ static void stmt(void) {
         if (eat("=")) { expr(); store(i); }
         expect(";");
     } else {
-        /* x = <expression>;  Work out the value and save it into x. */
+        /* x = <expression>;   x += <expression>;   x++;   x--;   ++x;   --x;
+         * Also -= *= /= %=. Assignment is a statement only, not an expression. */
         ws();
-        if (!isw(*p)) die("unsupported statement", 0);
-        ident();
-        int i = lookup();
-        expect("="); expr(); expect(";");
-        store(i);
+        if (eat("++")) { ident(); add_const(lookup(), 1); }
+        else if (eat("--")) { ident(); add_const(lookup(), -1); }
+        else {
+            if (!isw(*p)) die("unsupported statement", 0);
+            ident();
+            int i = lookup();
+            if (eat("++")) add_const(i, 1);
+            else if (eat("--")) add_const(i, -1);
+            else {
+                int op = 0;
+                if (eat("+=")) op = '+'; else if (eat("-=")) op = '-'; else if (eat("*=")) op = '*';
+                else if (eat("/=")) op = '/'; else if (eat("%=")) op = '%';
+                if (op) { expr(); modify(i, op); }
+                else { expect("="); expr(); store(i); }
+            }
+        }
+        expect(";");
     }
 }
 
