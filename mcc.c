@@ -37,7 +37,17 @@ static char *p;
 static long slen(char *s) { long n = 0; while (s[n]) n++; return n; }
 static void err(char *s) { sys(1, 2, (long)s, slen(s)); }
 static void die(char *m, char *x) {
-    err("mcc: "); err(m); if (x) { err(" '"); err(x); err("'"); } err("\n");
+    err("mcc: ");
+    if (p) {                            /* once the source is loaded, say which line the problem is on */
+        int line = 1;
+        for (char *q = src; q < p; q++) if (*q == '\n') line++;
+        char digits[12];
+        int i = 11;
+        digits[i] = 0;
+        do { digits[--i] = '0' + line % 10; line /= 10; } while (line);
+        err("line "); err(digits + i); err(": ");
+    }
+    err(m); if (x) { err(" '"); err(x); err("'"); } err("\n");
     sys(60, 1, 0, 0);
 }
 
@@ -52,9 +62,10 @@ static void ws(void) {
         if (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') p++;
         else if (p[0] == '/' && p[1] == '/') { while (*p && *p != '\n') p++; }
         else if (p[0] == '/' && p[1] == '*') {
+            char *start = p;
             p += 2;
             while (*p && !(p[0] == '*' && p[1] == '/')) p++;
-            if (!*p) die("unterminated comment", 0);
+            if (!*p) { p = start; die("unterminated comment", 0); }   /* point at where it began */
             p += 2;
         }
         else return;

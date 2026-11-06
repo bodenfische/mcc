@@ -46,6 +46,16 @@ fails() {
     fi
 }
 
+# says NAME FILE.c MESSAGE   (mcc must fail with exactly this message)
+says() {
+    got=$(./mcc "$2" "$tmp/t" 2>&1); status=$?
+    if [ "$status" != 0 ] && [ "$got" = "$3" ]; then
+        echo "ok   $1"; pass=$((pass + 1))
+    else
+        echo "FAIL $1 (got: $got)"; fail=$((fail + 1))
+    fi
+}
+
 finish() {
     echo "$pass passed, $fail failed"
     [ "$fail" = 0 ]
