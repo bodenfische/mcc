@@ -15,6 +15,6 @@ Currently compiles `int main() { ... }` containing:
 
 `//` and `/* */` comments work anywhere.
 
-Expressions: numbers, variables, `+ - * / %`, `== != < > <= >=` (give 1 or 0), brackets, unary minus.
+Expressions: numbers, variables, `+ - * / %`, `== != < > <= >=` and `&& || !` (all give 1 or 0, and `&&` / `||` skip the right side when they can), brackets, unary minus.
 
     sh tests/run.sh    # builds mcc with gcc, runs the tests

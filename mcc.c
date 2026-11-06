@@ -174,6 +174,12 @@ static void factor(void) {
     ws();
     if (eat("(")) { expr(); expect(")"); }
     else if (eat("-")) { factor(); emit(0xf7); emit(0xd8); }       /* neg eax */
+    else if (eat("!")) {                                            /* 1 if it was zero, otherwise 0 */
+        factor();
+        emit(0x85); emit(0xc0);                                     /* is eax zero? */
+        emit(0x0f); emit(0x94); emit(0xc0);                         /* al = 1 if it was, otherwise 0 */
+        emit(0x0f); emit(0xb6); emit(0xc0);                         /* eax = al */
+    }
     else if (*p >= '0' && *p <= '9') {
         u32 v = 0;
         while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
@@ -229,8 +235,7 @@ static void relation(void) {
     }
 }
 
-/* == and != are the loosest, so this is the top: a whole expression. */
-static void expr(void) {
+static void equality(void) {            /* == != */
     relation();
     for (;;) {
         int cc;
@@ -244,6 +249,7 @@ static void expr(void) {
  * written, so these leave the distance blank and hand back where it is. Once the
  * code to skip is done, here() goes back and fills the distance in. */
 static int jump_if_zero(void) { emit(0x0f); emit(0x84); emit32(0); return nc - 4; }
+static int jump_if_nonzero(void) { emit(0x0f); emit(0x85); emit32(0); return nc - 4; }
 static int jump(void) { emit(0xe9); emit32(0); return nc - 4; }
 static void jump_back(int target) {     /* a jump to code that's already been written */
     emit(0xe9);
@@ -252,6 +258,49 @@ static void jump_back(int target) {     /* a jump to code that's already been wr
 static void here(int at) {
     u32 rel = nc - (at + 4);            /* distances count from the end of the jump instruction */
     for (int k = 0; k < 4; k++) code[at + k] = rel >> (8 * k);
+}
+
+/* && and || short-circuit, so they skip the push/pop recipe and use jumps: each
+ * operand is tested, and one that settles the result jumps to the end. The
+ * result is normalised to 1 or 0. A chain keeps its pending jumps in a list. */
+static void logical_and(void) {
+    equality();
+    if (!eat("&&")) return;
+    int miss[33], n = 0;
+    do {
+        emit(0x85); emit(0xc0);                         /* is eax zero? */
+        if (n == 32) die("too many && in a row", 0);
+        miss[n++] = jump_if_zero();                     /* yes: the whole thing is false */
+        equality();
+    } while (eat("&&"));
+    emit(0x85); emit(0xc0);
+    miss[n++] = jump_if_zero();
+    emit(0xb8); emit32(1);                              /* every part was true: eax = 1 */
+    int done = jump();
+    for (int i = 0; i < n; i++) here(miss[i]);
+    emit(0x31); emit(0xc0);                             /* eax = 0 */
+    here(done);
+}
+
+/* == and != are not the loosest any more: && and || are, so this is the top,
+ * a whole expression. || is looser than &&, as in C. */
+static void expr(void) {
+    logical_and();
+    if (!eat("||")) return;
+    int hit[33], n = 0;
+    do {
+        emit(0x85); emit(0xc0);                         /* is eax zero? */
+        if (n == 32) die("too many || in a row", 0);
+        hit[n++] = jump_if_nonzero();                   /* no: the whole thing is true */
+        logical_and();
+    } while (eat("||"));
+    emit(0x85); emit(0xc0);
+    hit[n++] = jump_if_nonzero();
+    emit(0x31); emit(0xc0);                             /* every part was false: eax = 0 */
+    int done = jump();
+    for (int i = 0; i < n; i++) here(hit[i]);
+    emit(0xb8); emit32(1);                              /* eax = 1 */
+    here(done);
 }
 
 static void stmt(void) {

@@ -20,5 +20,9 @@ fails while-no-brackets 'while 1 putn(1);'
 fails while-unclosed     'while (1 putn(1);'
 fails while-no-condition 'while () putn(1);'
 fails unterminated-comment 'putn(1); /* never ends'
+fails and-no-right      'putn(1 &&);'
+fails or-no-right       'putn(1 ||);'
+fails and-no-left       'putn(&& 1);'
+fails not-no-operand    'putn(!);'
 
 finish
