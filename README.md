@@ -5,7 +5,7 @@ Micro C compiler.
     gcc -static -nostdlib -ffreestanding -fno-stack-protector -O1 -o mcc mcc.c
     ./mcc examples/hello.c hello && ./hello
 
-Currently compiles `int main() { ... }` containing:
+Currently compiles a file of functions (`int` or `void`, up to 12 `int` parameters, prototypes, recursion), one of them `int main()`. A function has to be declared before it's called, as in C. Inside a function:
 
     int x = 5;  int y;  x = x + 1;   // int variables only
     x++;  x--;  ++x;  --x;  x += <expression>;  (also -= *= /= %=)
@@ -17,6 +17,6 @@ Currently compiles `int main() { ... }` containing:
 
 `//` and `/* */` comments work anywhere.
 
-Expressions: numbers, variables, `+ - * / %`, `== != < > <= >=` and `x++ x-- ++x --x`, `&& || !` (all give 1 or 0, and `&&` / `||` skip the right side when they can), brackets, unary minus.
+Expressions: numbers (decimal, hex like `0x1F`, characters like `'a'` and `'\n'`), variables, `+ - * / %`, `== != < > <= >=` and `x++ x-- ++x --x`, `&& || !` (all give 1 or 0, and `&&` / `||` skip the right side when they can), brackets, unary minus.
 
     sh tests/run.sh    # builds mcc with gcc, runs the tests

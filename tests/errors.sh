@@ -47,5 +47,11 @@ fails for-bad-init       'for (5; ;) putn(1);'
 fails for-empty-brackets 'for (;) putn(1);'
 fails for-var-escapes    'for (int i = 0; i < 3; i++) putn(i); putn(i);'
 fails for-undeclared     'for (int i = 0; i < 3; i++) putn(j);'
+fails hex-no-digits     'putn(0x);'
+fails hex-bad-digit     'putn(0xg);'
+fails char-empty        "putn('');"
+fails char-unclosed     "putn('a);"
+fails char-too-long     "putn('ab');"
+fails char-lone-slash   "putn('\\');"
 
 finish

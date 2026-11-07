@@ -1,7 +1,8 @@
 /* mcc - micro C compiler for Linux x86-64. No libc.
  * Build:  gcc -static -nostdlib -ffreestanding -fno-stack-protector -O1 -o mcc mcc.c
  * Use:    ./mcc in.c [out]    (out defaults to a.out)
- * Reads:  int main() { int i = 0; while (i < 3) { putn(i); i = i + 1; } return i; }
+ * Reads:  int fact(int n) { if (n < 2) return 1; return n * fact(n - 1); }
+ *          int main() { putn(fact(5)); return 0; }
  */
 typedef unsigned long u64;
 typedef unsigned int u32;
@@ -21,16 +22,30 @@ static u32 patch_at[64], patch_str[64];
 static u32 call_at[64];
 static int ncall;
 
-/* Local variables live on the stack, 4 bytes each: the first at [rbp-4], the
- * second at [rbp-8], and so on. A variable's position in this table is all that's
- * needed to find it again. vname holds the names, nvar says how many there are.
+/* Variables are found by their position in this table: vname holds the names,
+ * voff where each one sits relative to rbp, and nvar says how many there are.
+ * Parameters come first. The caller pushed them, so they're above rbp
+ * ([rbp+16] and up, 8 bytes each). Locals are 4 bytes each below it: the first at
+ * [rbp-4], the second at [rbp-8], and so on. The table starts over for each function.
  *
  * A { } block gets its own scope: variables declared inside it vanish at the
  * closing brace, and their stack slots get reused. scope is the first variable
- * that belongs to the current block, and maxvar is the most variables alive at
- * once, which decides how much stack space the function needs. */
+ * that belongs to the current block, nparams how many of the variables are
+ * parameters, and maxvar the most locals alive at once, which decides how much
+ * stack space the function needs. */
 static char vname[64][32];
-static int nvar, scope, maxvar;
+static int voff[64];
+static int nvar, nparams, scope, maxvar;
+
+/* Functions: name, parameter count, whether it returns void, and where its code
+ * starts (-1 until it's defined). Calls are recorded as they're generated and
+ * pointed at the right address once everything is defined. Entry 0 is always main. */
+static char fname[32][32];
+static int fparams[32], fvoid[32], faddr[32];
+static int nfn;
+static u32 fcall_at[256];
+static int fcall_fn[256], nfcall;
+static int curvoid;                     /* is the function being compiled void? */
 static char name[32];                   /* the name ident() just read */
 static char *p;
 
@@ -115,18 +130,18 @@ static int lookup(void) {
     return i;
 }
 
-/* Variable number i sits at [rbp - 4*(i+1)]. These copy it into eax and back. */
-static void load(int i)  { emit(0x8b); emit(0x85); emit32(-4 * (i + 1)); }   /* eax = the variable */
-static void store(int i) { emit(0x89); emit(0x85); emit32(-4 * (i + 1)); }   /* the variable = eax */
+/* Variable number i sits at [rbp + voff[i]]. These copy it into eax and back. */
+static void load(int i)  { emit(0x8b); emit(0x85); emit32(voff[i]); }       /* eax = the variable */
+static void store(int i) { emit(0x89); emit(0x85); emit32(voff[i]); }       /* the variable = eax */
 
 /* ++ and -- change the variable in memory directly, leaving eax alone. */
 static void add_const(int i, int amount) {                                   /* the variable += amount (1 or -1) */
-    emit(0x83); emit(0x85); emit32(-4 * (i + 1)); emit(amount & 0xff);
+    emit(0x83); emit(0x85); emit32(voff[i]); emit(amount & 0xff);
 }
 
 /* The compound assignments: variable = variable op eax, where op is one of + - * / % */
 static void modify(int i, int op) {
-    int off = -4 * (i + 1);
+    int off = voff[i];
     if (op == '+') { emit(0x01); emit(0x85); emit32(off); }                  /* add [variable], eax */
     else if (op == '-') { emit(0x29); emit(0x85); emit32(off); }             /* sub [variable], eax */
     else if (op == '*') {
@@ -141,10 +156,11 @@ static void modify(int i, int op) {
     }
 }
 
-static void exit_with(u32 code_) {
-    emit(0xbf); emit32(code_);          /* edi = exit code */
-    emit(0xb8); emit32(60);             /* eax = 60 (exit) */
-    emit(0x0f); emit(0x05);             /* syscall */
+/* Leave the current function, with the result in eax. */
+static void leave(void) {
+    emit(0x48); emit(0x89); emit(0xec);                 /* rsp = rbp, dropping the locals */
+    emit(0x5d);                                         /* restore the caller's rbp */
+    emit(0xc3);                                         /* return */
 }
 
 /* Machine code for putn: prints the number in eax, then a newline.
@@ -181,16 +197,59 @@ static u8 putn_code[] = {
     0xc3,                            /* return */
 };
 
-/* exit with whatever is in eax */
-static void exit_eax(void) {
-    emit(0x89); emit(0xc7);             /* edi = eax */
-    emit(0xb8); emit32(60);             /* eax = 60 (exit) */
-    emit(0x0f); emit(0x05);             /* syscall */
-}
-
 /* Expressions. Every function leaves its answer in eax.
  * For "a op b": work out a, push it, work out b, move b to ecx, pop a, do the op. */
 static void expr(void);
+
+/* The character a backslash escape stands for, in a string or a 'c' literal.
+ * Called with p just past the backslash. \\ \' and \" are themselves. */
+static int escape(void) {
+    if (!*p) die("bad escape", 0);
+    char c = *p++;
+    if (c == 'n') return 10;
+    if (c == 't') return 9;
+    if (c == 'r') return 13;
+    if (c == '0') return 0;
+    return c;
+}
+
+/* The value of a hex digit, or -1 if it isn't one. */
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int same(char *a, char *b) {
+    int j = 0;
+    while (a[j] == b[j] && a[j]) j++;
+    return a[j] == b[j];
+}
+
+/* Which function has the name in name[]? Gives its number, or -1. */
+static int find_fn(void) {
+    for (int i = 0; i < nfn; i++) if (same(fname[i], name)) return i;
+    return -1;
+}
+
+/* Code for a call to function f, called just after its "(". The arguments are
+ * worked out left to right and pushed, so the last one ends up nearest the top of
+ * the stack. The result comes back in eax. The caller drops the arguments again. */
+static void call(int f) {
+    int n = 0;
+    if (!eat(")")) {
+        do {
+            if (n == 12) die("too many arguments", 0);
+            expr(); emit(0x50); n++;
+        } while (eat(","));
+        expect(")");
+    }
+    if (n != fparams[f]) die("wrong number of arguments to", fname[f]);
+    if (nfcall == 256) die("too many calls", 0);
+    emit(0xe8); fcall_at[nfcall] = nc; fcall_fn[nfcall++] = f; emit32(0);   /* address filled in once all functions are defined */
+    if (n) { emit(0x48); emit(0x83); emit(0xc4); emit(8 * n); }              /* rsp += 8 * n */
+}
 
 static void factor(void) {
     ws();
@@ -206,13 +265,32 @@ static void factor(void) {
     }
     else if (*p >= '0' && *p <= '9') {
         u32 v = 0;
-        while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {          /* hex, like 0x1F */
+            p += 2;
+            if (hexval(*p) < 0) die("expected hex digits", 0);
+            while (hexval(*p) >= 0) v = v * 16 + hexval(*p++);
+        } else while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
         emit(0xb8); emit32(v);                                      /* eax = number */
-    } else if (isw(*p)) {                                           /* a variable, maybe with x++ or x-- */
+    } else if (*p == '\'') {                                        /* 'a' is just the number 97 */
+        p++;
+        if (*p == '\'' || *p == '\n' || !*p) die("bad character literal", 0);
+        int c = *p++;
+        if (c == '\\') c = escape();
+        if (*p != '\'') die("bad character literal", 0);
+        p++;
+        emit(0xb8); emit32(c);                                      /* eax = the character's value */
+    } else if (isw(*p)) {
         ident();
-        int i = lookup();
-        load(i);                                                    /* eax = the old value, which x++ gives back */
-        if (eat("++")) add_const(i, 1); else if (eat("--")) add_const(i, -1);
+        if (eat("(")) {                                             /* a call, like f(a, b) */
+            int f = find_fn();
+            if (f < 0) die("undeclared function", name);
+            if (fvoid[f]) die("void function used as a value", name);
+            call(f);
+        } else {                                                    /* a variable, maybe with x++ or x-- */
+            int i = lookup();
+            load(i);                                                /* eax = the old value, which x++ gives back */
+            if (eat("++")) add_const(i, 1); else if (eat("--")) add_const(i, -1);
+        }
     }
     else die("expected expression", 0);
 }
@@ -343,8 +421,9 @@ static void declare(void) {
     if (find(scope) >= 0) die("already declared", name);
     if (nvar == 64) die("too many variables", 0);
     int i = nvar++;
-    if (nvar > maxvar) maxvar = nvar;
+    if (nvar - nparams > maxvar) maxvar = nvar - nparams;
     for (int j = 0; j < 32; j++) vname[i][j] = name[j];
+    voff[i] = -4 * (i - nparams + 1);                   /* locals sit below rbp, after the parameters in the table */
     if (eat("=")) { expr(); store(i); }
 }
 
@@ -357,6 +436,12 @@ static void simple(void) {
     else {
         if (!isw(*p)) die("unsupported statement", 0);
         ident();
+        if (eat("(")) {                                 /* a call used as a statement; any result is dropped */
+            int f = find_fn();
+            if (f < 0) die("undeclared function", name);
+            call(f);
+            return;
+        }
         int i = lookup();
         if (eat("++")) add_const(i, 1);
         else if (eat("--")) add_const(i, -1);
@@ -378,10 +463,7 @@ static void stmt(void) {
             char c = *p++;
             if (!c) die("unterminated string", 0);
             if (c == '"') break;
-            if (c == '\\') {
-                c = *p++;
-                if (c == 'n') c = 10; else if (c == 't') c = 9; else if (c == '0') c = 0;
-            }
+            if (c == '\\') c = escape();
             data[nd++] = c;
         }
         data[nd++] = '\n';
@@ -396,9 +478,10 @@ static void stmt(void) {
         if (ncall == 64) die("too many putn calls", 0);
         emit(0xe8); call_at[ncall++] = nc; emit32(0);   /* call putn, address filled in later */
     } else if (eat("return")) {
-        expr();
+        /* return expression;  or just  return;  in a void function */
+        if (!curvoid) expr();
         expect(";");
-        exit_eax();
+        leave();
     } else if (eat("{")) {
         /* { ... } a block: any number of statements. Variables declared inside
          * are forgotten at the closing brace. */
@@ -476,6 +559,70 @@ static void stmt(void) {
     }
 }
 
+static char pname[12][32];              /* parameter names, empty if a prototype leaves them out */
+
+/* One function at the top level: either a definition, or a prototype ending in ";"
+ * (which lets earlier code call a function that's defined further down). */
+static void function(void) {
+    int isvoid = 0;
+    if (eat("int")) isvoid = 0; else if (eat("void")) isvoid = 1; else die("expected a function", 0);
+    ident();
+    char fn[32];
+    for (int j = 0; j < 32; j++) fn[j] = name[j];
+    expect("(");
+
+    int n = 0;                                          /* the parameters: (), (void), or ints with optional names */
+    if (eat("void")) expect(")");
+    else if (!eat(")")) {
+        do {
+            if (n == 12) die("too many parameters", 0);
+            expect("int");
+            ws();
+            if (isw(*p)) { ident(); for (int j = 0; j < 32; j++) pname[n][j] = name[j]; }
+            else pname[n][0] = 0;
+            n++;
+        } while (eat(","));
+        expect(")");
+    }
+
+    int f = -1;                                         /* a prototype and the definition must agree */
+    for (int i = 0; i < nfn; i++) if (same(fname[i], fn)) f = i;
+    if (f >= 0) {
+        if (fparams[f] != n || fvoid[f] != isvoid) die("conflicting declaration of", fn);
+    } else {
+        if (nfn == 32) die("too many functions", 0);
+        f = nfn++;
+        for (int j = 0; j < 32; j++) fname[f][j] = fn[j];
+        fparams[f] = n; fvoid[f] = isvoid; faddr[f] = -1;
+    }
+    if (eat(";")) return;
+
+    expect("{");
+    if (faddr[f] >= 0) die("already defined", fn);
+    faddr[f] = nc;
+
+    /* Start of the function: the parameters become its first variables. Then room
+     * is made on the stack for the locals. How many there are isn't known until
+     * the whole function has been read, so the amount is left blank for now. */
+    nvar = 0; scope = 0; maxvar = 0; nparams = n; curvoid = isvoid;
+    for (int k = 0; k < n; k++) {
+        if (!pname[k][0]) die("parameter needs a name", 0);
+        for (int j = 0; j < 32; j++) name[j] = pname[k][j];
+        if (find(0) >= 0) die("already declared", name);
+        for (int j = 0; j < 32; j++) vname[nvar][j] = name[j];
+        voff[nvar++] = 16 + 8 * (n - 1 - k);            /* pushed first means furthest from rbp */
+    }
+    emit(0x55);                                         /* save rbp */
+    emit(0x48); emit(0x89); emit(0xe5);                 /* rbp = rsp, so variables can be found relative to rbp */
+    emit(0x48); emit(0x81); emit(0xec);                 /* move rsp down to make room for the locals */
+    int frame_at = nc; emit32(0);                       /* the amount, filled in below */
+    while (!eat("}")) stmt();
+    emit(0x31); emit(0xc0);                             /* running off the end returns 0, which is what main needs */
+    leave();
+    u32 frame = (maxvar * 4 + 15) & ~15;                /* 4 bytes each, rounded up to a multiple of 16 */
+    for (int k = 0; k < 4; k++) code[frame_at + k] = frame >> (8 * k);
+}
+
 static int qmain(int argc, char **argv) {
     if (argc < 2) die("usage: mcc in.c [out]", 0);
     long fd = sys(2, (long)argv[1], 0, 0);
@@ -485,18 +632,27 @@ static int qmain(int argc, char **argv) {
     src[n] = 0;
     p = src;
 
-    /* Start of main: make room on the stack for the variables. The number of them
-     * isn't known until the whole function has been read, so the amount is left
-     * blank here and filled in afterwards. */
-    expect("int"); expect("main"); expect("("); eat("void"); expect(")"); expect("{");
-    emit(0x55);                                         /* save rbp */
-    emit(0x48); emit(0x89); emit(0xe5);                 /* rbp = rsp, so variables can be found relative to rbp */
-    emit(0x48); emit(0x81); emit(0xec);                 /* move rsp down to make room for them */
-    int frame_at = nc; emit32(0);                       /* the amount, filled in below */
-    while (!eat("}")) stmt();
-    exit_with(0);
-    u32 frame = (maxvar * 4 + 15) & ~15;                /* 4 bytes each, rounded up to a multiple of 16 */
-    for (int k = 0; k < 4; k++) code[frame_at + k] = frame >> (8 * k);
+    /* The program starts with a few instructions that call main and then exit with
+     * whatever it returned, so main is an ordinary function. main is function 0. */
+    for (int j = 0; "main"[j]; j++) fname[0][j] = "main"[j];
+    nfn = 1; faddr[0] = -1;
+    emit(0xe8); fcall_at[nfcall] = nc; fcall_fn[nfcall++] = 0; emit32(0);   /* call main */
+    emit(0x89); emit(0xc7);                             /* edi = eax, the exit code */
+    emit(0xb8); emit32(60);                             /* eax = 60 (exit) */
+    emit(0x0f); emit(0x05);                             /* syscall */
+
+    ws();
+    while (*p) { function(); ws(); }
+    if (faddr[0] < 0) { p = 0; die("no main function", 0); }
+
+    /* Every call was written with a blank address, because the function might not
+     * have existed yet. Now they all do, so point each call at its function. */
+    for (int i = 0; i < nfcall; i++) {
+        int f = fcall_fn[i];
+        if (faddr[f] < 0) { p = 0; die("declared but never defined", fname[f]); }
+        u32 rel = faddr[f] - (fcall_at[i] + 4);
+        for (int k = 0; k < 4; k++) code[fcall_at[i] + k] = rel >> (8 * k);
+    }
 
     if (ncall) {                        /* add putn after the program, then fix the calls */
         int at = nc;
