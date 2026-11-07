@@ -332,6 +332,44 @@ static void expr(void) {
     here(done);
 }
 
+/* The two kinds of statement that a for loop can have in its brackets, so they're
+ * parsed without the closing ";". */
+
+/* x  or  x = <expression>  (after "int"). Reserves a slot for the name. A bare
+ * "int x;" makes no code, so the slot keeps whatever was there, as in C. A name can
+ * only clash with one from the same block, so an inner block may reuse an outer name. */
+static void declare(void) {
+    ident();
+    if (find(scope) >= 0) die("already declared", name);
+    if (nvar == 64) die("too many variables", 0);
+    int i = nvar++;
+    if (nvar > maxvar) maxvar = nvar;
+    for (int j = 0; j < 32; j++) vname[i][j] = name[j];
+    if (eat("=")) { expr(); store(i); }
+}
+
+/* x = e   x += e   x -= e   x *= e   x /= e   x %= e   x++   x--   ++x   --x
+ * Assignment is a statement only, not an expression. */
+static void simple(void) {
+    ws();
+    if (eat("++")) { ident(); add_const(lookup(), 1); }
+    else if (eat("--")) { ident(); add_const(lookup(), -1); }
+    else {
+        if (!isw(*p)) die("unsupported statement", 0);
+        ident();
+        int i = lookup();
+        if (eat("++")) add_const(i, 1);
+        else if (eat("--")) add_const(i, -1);
+        else {
+            int op = 0;
+            if (eat("+=")) op = '+'; else if (eat("-=")) op = '-'; else if (eat("*=")) op = '*';
+            else if (eat("/=")) op = '/'; else if (eat("%=")) op = '%';
+            if (op) { expr(); modify(i, op); }
+            else { expect("="); expr(); store(i); }
+        }
+    }
+}
+
 static void stmt(void) {
     if (eat("puts")) {
         expect("("); expect("\"");
@@ -395,39 +433,45 @@ static void stmt(void) {
         stmt();
         jump_back(top);
         here(skip);
+    } else if (eat("for")) {
+        /* for (init; condition; step) statement
+         * Any of the three parts can be left empty, and an empty condition is
+         * always true. A variable declared in init lasts as long as the loop.
+         * The step is written before the body in the source but has to run after
+         * it, so the layout is:
+         *     init
+         *     top:   condition, jump to end if false
+         *            jump to body
+         *     step:  step, jump to top
+         *     body:  body, jump to step
+         *     end: */
+        int saved = nvar, outer = scope;
+        scope = nvar;
+        expect("(");
+        if (!eat(";")) {
+            if (eat("int")) declare(); else simple();
+            expect(";");
+        }
+        int top = nc, skip = -1;
+        if (!eat(";")) {
+            expr(); expect(";");
+            emit(0x85); emit(0xc0);                     /* is eax zero? */
+            skip = jump_if_zero();
+        }
+        int to_body = jump();
+        int step = nc;
+        if (!eat(")")) { simple(); expect(")"); }
+        jump_back(top);
+        here(to_body);
+        stmt();
+        jump_back(step);
+        if (skip >= 0) here(skip);
+        nvar = saved; scope = outer;
     } else if (eat("int")) {
-        /* int x;  or  int x = <expression>;
-         * Reserve a slot for the name. "int x;" on its own makes no code, so the
-         * slot keeps whatever was there before, like in C. A name can only clash
-         * with one from the same block, so an inner block may reuse an outer name. */
-        ident();
-        if (find(scope) >= 0) die("already declared", name);
-        if (nvar == 64) die("too many variables", 0);
-        int i = nvar++;
-        if (nvar > maxvar) maxvar = nvar;
-        for (int j = 0; j < 32; j++) vname[i][j] = name[j];
-        if (eat("=")) { expr(); store(i); }
+        declare();
         expect(";");
     } else {
-        /* x = <expression>;   x += <expression>;   x++;   x--;   ++x;   --x;
-         * Also -= *= /= %=. Assignment is a statement only, not an expression. */
-        ws();
-        if (eat("++")) { ident(); add_const(lookup(), 1); }
-        else if (eat("--")) { ident(); add_const(lookup(), -1); }
-        else {
-            if (!isw(*p)) die("unsupported statement", 0);
-            ident();
-            int i = lookup();
-            if (eat("++")) add_const(i, 1);
-            else if (eat("--")) add_const(i, -1);
-            else {
-                int op = 0;
-                if (eat("+=")) op = '+'; else if (eat("-=")) op = '-'; else if (eat("*=")) op = '*';
-                else if (eat("/=")) op = '/'; else if (eat("%=")) op = '%';
-                if (op) { expr(); modify(i, op); }
-                else { expect("="); expr(); store(i); }
-            }
-        }
+        simple();
         expect(";");
     }
 }

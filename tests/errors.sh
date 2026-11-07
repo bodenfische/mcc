@@ -39,5 +39,13 @@ fails minus-eq-no-value   'int x; x -= ;'
 fails times-eq-no-value   'int x; x *= ;'
 fails div-eq-no-value     'int x; x /= ;'
 fails mod-eq-no-value     'int x; x %= ;'
+fails for-missing-semi   'for (int i = 0 i < 3; i++) putn(i);'
+fails for-missing-semi2  'for (int i = 0; i < 3 i++) putn(i);'
+fails for-unclosed       'for (int i = 0; i < 3; i++ putn(i);'
+fails for-no-brackets    'for int i = 0; i < 3; i++ putn(i);'
+fails for-bad-init       'for (5; ;) putn(1);'
+fails for-empty-brackets 'for (;) putn(1);'
+fails for-var-escapes    'for (int i = 0; i < 3; i++) putn(i); putn(i);'
+fails for-undeclared     'for (int i = 0; i < 3; i++) putn(j);'
 
 finish

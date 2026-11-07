@@ -12,6 +12,7 @@ Currently compiles `int main() { ... }` containing:
     puts("...");  putn(<expression>);  return <expression>;
     if (<expression>) <statement>  else <statement>
     while (<expression>) <statement>
+    for (<init>; <expression>; <step>) <statement>   // any part can be empty
     { <statements> }               // a block, variables inside stay inside
 
 `//` and `/* */` comments work anywhere.
