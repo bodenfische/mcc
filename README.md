@@ -5,7 +5,7 @@ Micro C compiler.
     gcc -static -nostdlib -ffreestanding -fno-stack-protector -O1 -o mcc mcc.c
     ./mcc examples/hello.c hello && ./hello
 
-Currently compiles a file of functions (`int` or `void`, up to 12 `int` parameters, prototypes, recursion), one of them `int main()`. A function has to be declared before it's called, as in C. Inside a function:
+Currently compiles a file of functions (`int` or `void`, up to 12 `int` parameters, prototypes, recursion), one of them `int main()`. A function has to be declared before it's called, as in C. Global `int` variables work too (zero unless given a starting value, which has to be a single number), and `static` is accepted. Inside a function:
 
     int x = 5;  int y;  x = x + 1;   // int variables only
     x++;  x--;  ++x;  --x;  x += <expression>;  (also -= *= /= %=)

@@ -43,6 +43,18 @@ static int nvar, nparams, scope, maxvar;
 static char fname[32][32];
 static int fparams[32], fvoid[32], faddr[32];
 static int nfn;
+
+/* Global variables. The ones with a starting value live in the data area, next to
+ * the strings, and the rest in zeroed memory after it (like C's bss), which costs
+ * nothing in the file. goff is where each one is: from the start of the data area,
+ * or from the start of the zeroed part when gbss is set. Code that uses a global
+ * can't know its address yet (it depends on how big the code turns out to be), so
+ * each use is noted in gfix and filled in at the end. A negative gfix_off means an
+ * offset into the zeroed part, counted as -1 - offset. */
+static char gname[256][32];
+static int goff[256], gbss[256], nglob, gbss_size;
+static u32 gfix_at[4096];
+static int gfix_off[4096], ngfix;
 static u32 fcall_at[256];
 static int fcall_fn[256], nfcall;
 static int curvoid;                     /* is the function being compiled void? */
@@ -123,29 +135,57 @@ static int find(int lo) {
     return -1;
 }
 
-/* Same, but a missing variable is an error. */
-static int lookup(void) {
-    int i = find(0);
-    if (i < 0) die("undeclared", name);
-    return i;
+static int same(char *a, char *b) {
+    int j = 0;
+    while (a[j] == b[j] && a[j]) j++;
+    return a[j] == b[j];
 }
 
-/* Variable number i sits at [rbp + voff[i]]. These copy it into eax and back. */
-static void load(int i)  { emit(0x8b); emit(0x85); emit32(voff[i]); }       /* eax = the variable */
-static void store(int i) { emit(0x89); emit(0x85); emit32(voff[i]); }       /* the variable = eax */
+/* Which global has this name? Gives its number, or -1. */
+static int find_global(char *n) {
+    for (int g = 0; g < nglob; g++) if (same(gname[g], n)) return g;
+    return -1;
+}
+
+/* Find the variable called name[]: a local if there is one, otherwise a global.
+ * A reference to a variable is a number: 0 or more is a local (its place in the
+ * table), and -1 - g is global number g. A missing variable is an error. */
+static int lookup(void) {
+    int i = find(0);
+    if (i >= 0) return i;
+    int g = find_global(name);
+    if (g < 0) die("undeclared", name);
+    return -1 - g;
+}
+
+/* The part of an instruction that says where variable r is. A local is
+ * [rbp + offset]. A global is an absolute address, which isn't known yet, so it's
+ * left blank and noted down to be filled in at the end. */
+static void where(int r) {
+    if (r >= 0) { emit(0x85); emit32(voff[r]); return; }
+    int g = -1 - r;
+    if (ngfix == 4096) die("too many uses of globals", 0);
+    emit(0x04); emit(0x25);                             /* an absolute 32 bit address follows */
+    gfix_at[ngfix] = nc;
+    gfix_off[ngfix++] = gbss[g] ? -1 - goff[g] : goff[g];
+    emit32(0);
+}
+
+/* These copy a variable into eax and back. */
+static void load(int r)  { emit(0x8b); where(r); }                          /* eax = the variable */
+static void store(int r) { emit(0x89); where(r); }                          /* the variable = eax */
 
 /* ++ and -- change the variable in memory directly, leaving eax alone. */
-static void add_const(int i, int amount) {                                   /* the variable += amount (1 or -1) */
-    emit(0x83); emit(0x85); emit32(voff[i]); emit(amount & 0xff);
+static void add_const(int r, int amount) {                                   /* the variable += amount (1 or -1) */
+    emit(0x83); where(r); emit(amount & 0xff);
 }
 
 /* The compound assignments: variable = variable op eax, where op is one of + - * / % */
 static void modify(int i, int op) {
-    int off = voff[i];
-    if (op == '+') { emit(0x01); emit(0x85); emit32(off); }                  /* add [variable], eax */
-    else if (op == '-') { emit(0x29); emit(0x85); emit32(off); }             /* sub [variable], eax */
+    if (op == '+') { emit(0x01); where(i); }                                 /* add [variable], eax */
+    else if (op == '-') { emit(0x29); where(i); }                            /* sub [variable], eax */
     else if (op == '*') {
-        emit(0x0f); emit(0xaf); emit(0x85); emit32(off);                     /* eax = eax * variable */
+        emit(0x0f); emit(0xaf); where(i);                                    /* eax = eax * variable */
         store(i);
     } else {                                                                 /* / and %: the variable is the dividend */
         emit(0x89); emit(0xc1);                                              /* ecx = eax, the divisor */
@@ -221,12 +261,6 @@ static int hexval(char c) {
     return -1;
 }
 
-static int same(char *a, char *b) {
-    int j = 0;
-    while (a[j] == b[j] && a[j]) j++;
-    return a[j] == b[j];
-}
-
 /* Which function has the name in name[]? Gives its number, or -1. */
 static int find_fn(void) {
     for (int i = 0; i < nfn; i++) if (same(fname[i], name)) return i;
@@ -251,6 +285,27 @@ static void call(int f) {
     if (n) { emit(0x48); emit(0x83); emit(0xc4); emit(8 * n); }              /* rsp += 8 * n */
 }
 
+/* A number (decimal or hex like 0x1F) or a character like 'a', which is just the
+ * number 97. Gives its value. */
+static u32 literal(void) {
+    u32 v = 0;
+    if (*p == '\'') {
+        p++;
+        if (*p == '\'' || *p == '\n' || !*p) die("bad character literal", 0);
+        int c = *p++;
+        if (c == '\\') c = escape();
+        if (*p != '\'') die("bad character literal", 0);
+        p++;
+        return c;
+    }
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+        if (hexval(*p) < 0) die("expected hex digits", 0);
+        while (hexval(*p) >= 0) v = v * 16 + hexval(*p++);
+    } else while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+    return v;
+}
+
 static void factor(void) {
     ws();
     if (eat("(")) { expr(); expect(")"); }
@@ -263,23 +318,8 @@ static void factor(void) {
         emit(0x0f); emit(0x94); emit(0xc0);                         /* al = 1 if it was, otherwise 0 */
         emit(0x0f); emit(0xb6); emit(0xc0);                         /* eax = al */
     }
-    else if (*p >= '0' && *p <= '9') {
-        u32 v = 0;
-        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {          /* hex, like 0x1F */
-            p += 2;
-            if (hexval(*p) < 0) die("expected hex digits", 0);
-            while (hexval(*p) >= 0) v = v * 16 + hexval(*p++);
-        } else while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
-        emit(0xb8); emit32(v);                                      /* eax = number */
-    } else if (*p == '\'') {                                        /* 'a' is just the number 97 */
-        p++;
-        if (*p == '\'' || *p == '\n' || !*p) die("bad character literal", 0);
-        int c = *p++;
-        if (c == '\\') c = escape();
-        if (*p != '\'') die("bad character literal", 0);
-        p++;
-        emit(0xb8); emit32(c);                                      /* eax = the character's value */
-    } else if (isw(*p)) {
+    else if ((*p >= '0' && *p <= '9') || *p == '\'') { emit(0xb8); emit32(literal()); }   /* eax = the number */
+    else if (isw(*p)) {
         ident();
         if (eat("(")) {                                             /* a call, like f(a, b) */
             int f = find_fn();
@@ -561,15 +601,42 @@ static void stmt(void) {
 
 static char pname[12][32];              /* parameter names, empty if a prototype leaves them out */
 
-/* One function at the top level: either a definition, or a prototype ending in ";"
- * (which lets earlier code call a function that's defined further down). */
-static void function(void) {
+/* One thing at the top level of the file: a global variable, a function
+ * definition, or a prototype ending in ";" (which lets earlier code call a
+ * function that's defined further down). */
+static void toplevel(void) {
+    eat("static");                                      /* accepted and ignored: everything is file-local anyway */
     int isvoid = 0;
-    if (eat("int")) isvoid = 0; else if (eat("void")) isvoid = 1; else die("expected a function", 0);
+    if (eat("int")) isvoid = 0; else if (eat("void")) isvoid = 1; else die("expected a function or a variable", 0);
     ident();
     char fn[32];
     for (int j = 0; j < 32; j++) fn[j] = name[j];
-    expect("(");
+
+    if (!eat("(")) {                                    /* no bracket, so it's a global variable */
+        if (isvoid) die("a variable can't be void", fn);
+        if (find_global(fn) >= 0) die("already defined", fn);
+        for (int i = 0; i < nfn; i++) if (same(fname[i], fn)) die("already defined", fn);
+        if (nglob == 256) die("too many globals", 0);
+        int g = nglob++;
+        for (int j = 0; j < 32; j++) gname[g][j] = fn[j];
+        if (eat("=")) {                                 /* a starting value has to be a plain constant */
+            ws();
+            int neg = eat("-");
+            ws();
+            if (!((*p >= '0' && *p <= '9') || *p == '\'')) die("expected a constant", 0);
+            u32 v = literal();
+            if (neg) v = -v;
+            while (nd % 4) data[nd++] = 0;              /* keep it aligned */
+            goff[g] = nd; gbss[g] = 0;
+            for (int k = 0; k < 4; k++) data[nd++] = v >> (8 * k);
+            if (!eat(";")) die("a global's starting value can only be a single number", 0);
+            return;
+        }
+        goff[g] = gbss_size; gbss[g] = 1; gbss_size += 4;
+        expect(";");
+        return;
+    }
+    if (find_global(fn) >= 0) die("already defined", fn);
 
     int n = 0;                                          /* the parameters: (), (void), or ints with optional names */
     if (eat("void")) expect(")");
@@ -642,7 +709,7 @@ static int qmain(int argc, char **argv) {
     emit(0x0f); emit(0x05);                             /* syscall */
 
     ws();
-    while (*p) { function(); ws(); }
+    while (*p) { toplevel(); ws(); }
     if (faddr[0] < 0) { p = 0; die("no main function", 0); }
 
     /* Every call was written with a blank address, because the function might not
@@ -669,6 +736,10 @@ static int qmain(int argc, char **argv) {
         u32 v = dataaddr + patch_str[i];
         for (int k = 0; k < 4; k++) code[patch_at[i] + k] = v >> (8 * k);
     }
+    for (int i = 0; i < ngfix; i++) {                   /* globals: the zeroed part comes after the data */
+        u32 v = dataaddr + (gfix_off[i] < 0 ? nd + (-1 - gfix_off[i]) : gfix_off[i]);
+        for (int k = 0; k < 4; k++) code[gfix_at[i] + k] = v >> (8 * k);
+    }
     u64 total = hdr + nc + nd;
 
     /* ELF header */
@@ -678,7 +749,7 @@ static int qmain(int argc, char **argv) {
     o(64, 2); o(56, 2); o(1, 2); o(64, 2); o(0, 2); o(0, 2);
     /* program header: one segment, read/write/run */
     o(1, 4); o(7, 4); o(0, 8); o(base, 8); o(base, 8);
-    o(total, 8); o(total, 8); o(0x1000, 8);
+    o(total, 8); o(total + gbss_size, 8); o(0x1000, 8);    /* size in the file, then size in memory (the extra is zeroed) */
     for (int i = 0; i < nc; i++) out[no++] = code[i];
     for (int i = 0; i < nd; i++) out[no++] = data[i];
 

@@ -1,12 +1,6 @@
 # functions: parameters, calls, return, recursion, prototypes
 . "$(dirname "$0")/lib.sh"
 
-# prog NAME EXPECTED-OUTPUT   (the program text comes from stdin)
-prog() {
-    cat > "$tmp/p.c"
-    check "$1" "$2" "$tmp/p.c"
-}
-
 prog no-params 7 <<'EOC'
 int seven() { return 7; }
 int main() { putn(seven()); return 0; }
@@ -242,14 +236,6 @@ int three() { /* three */ return 3; }
 int main() { puts("hi"); putn(three()); return 0; }
 EOC
 
-# main's return value is the program's exit code
-exits() {
-    cat > "$tmp/p.c"
-    ./mcc "$tmp/p.c" "$tmp/x" && run "$tmp/x" > /dev/null
-    got=$?
-    if [ "$got" = "$2" ]; then echo "ok   $1"; pass=$((pass + 1)); else echo "FAIL $1 (exit $got, wanted $2)"; fail=$((fail + 1)); fi
-}
-
 exits exit-seven 7 <<'EOC'
 int main() { return 7; }
 EOC
@@ -266,12 +252,6 @@ EOC
 exits exit-from-early-return 3 <<'EOC'
 int main() { if (1) return 3; return 4; }
 EOC
-
-# things mcc must refuse
-refuse() {
-    cat > "$tmp/p.c"
-    if ./mcc "$tmp/p.c" "$tmp/x" 2>/dev/null; then echo "FAIL $1"; fail=$((fail + 1)); else echo "ok   $1"; pass=$((pass + 1)); fi
-}
 
 refuse call-before-declaration <<'EOC'
 int main() { putn(f()); return 0; }

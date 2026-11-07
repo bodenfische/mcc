@@ -46,6 +46,27 @@ fails() {
     fi
 }
 
+# Whole programs, for tests that need more than the inside of main:
+# prog NAME EXPECTED-OUTPUT   (the program text comes from stdin)
+prog() {
+    cat > "$tmp/p.c"
+    check "$1" "$2" "$tmp/p.c"
+}
+
+# main's return value is the program's exit code
+exits() {
+    cat > "$tmp/p.c"
+    ./mcc "$tmp/p.c" "$tmp/x" && run "$tmp/x" > /dev/null
+    got=$?
+    if [ "$got" = "$2" ]; then echo "ok   $1"; pass=$((pass + 1)); else echo "FAIL $1 (exit $got, wanted $2)"; fail=$((fail + 1)); fi
+}
+
+# refuse NAME   (the program text comes from stdin; mcc must not accept it)
+refuse() {
+    cat > "$tmp/p.c"
+    if ./mcc "$tmp/p.c" "$tmp/x" 2>/dev/null; then echo "FAIL $1"; fail=$((fail + 1)); else echo "ok   $1"; pass=$((pass + 1)); fi
+}
+
 # says NAME FILE.c MESSAGE   (mcc must fail with exactly this message)
 says() {
     got=$(./mcc "$2" "$tmp/t" 2>&1); status=$?
