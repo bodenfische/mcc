@@ -20,7 +20,7 @@ EOC
 says undeclared-line-4 "$tmp/b.c" "mcc: line 4: undeclared 'y'"
 
 printf 'int main( {\n' > "$tmp/c.c"
-says first-line "$tmp/c.c" "mcc: line 1: expected 'int'"
+says first-line "$tmp/c.c" "mcc: line 1: expected a parameter type"
 
 cat > "$tmp/d.c" <<'EOC'
 // comment

@@ -22,11 +22,18 @@ static u32 patch_at[64], patch_str[64];
 static u32 call_at[64];
 static int ncall;
 
+/* Types. A type is one of these numbers. int is 32 bits and long is 64. */
+static int VOID = 0;
+static int INT = 1;
+static int LONG = 2;
+
 /* Variables are found by their position in this table: vname holds the names,
- * voff where each one sits relative to rbp, and nvar says how many there are.
- * Parameters come first. The caller pushed them, so they're above rbp
- * ([rbp+16] and up, 8 bytes each). Locals are 4 bytes each below it: the first at
- * [rbp-4], the second at [rbp-8], and so on. The table starts over for each function.
+ * vtype the types, voff where each one sits relative to rbp, and nvar says how
+ * many there are. Parameters come first. The caller pushed them, so they're above
+ * rbp ([rbp+16] and up, 8 bytes each). Locals are below it, and every one gets an
+ * 8 byte slot whatever its type: the first at [rbp-8], the second at [rbp-16], and
+ * so on. An int just uses the low half of its slot. The table starts over for each
+ * function.
  *
  * A { } block gets its own scope: variables declared inside it vanish at the
  * closing brace, and their stack slots get reused. scope is the first variable
@@ -34,14 +41,15 @@ static int ncall;
  * parameters, and maxvar the most locals alive at once, which decides how much
  * stack space the function needs. */
 static char vname[64][32];
+static int vtype[64];
 static int voff[64];
 static int nvar, nparams, scope, maxvar;
 
-/* Functions: name, parameter count, whether it returns void, and where its code
+/* Functions: name, return type, parameter count and types, and where its code
  * starts (-1 until it's defined). Calls are recorded as they're generated and
  * pointed at the right address once everything is defined. Entry 0 is always main. */
 static char fname[32][32];
-static int fparams[32], fvoid[32], faddr[32];
+static int ftype[32], fparams[32], fptype[32][12], faddr[32];
 static int nfn;
 
 /* Global variables. The ones with a starting value live in the data area, next to
@@ -52,12 +60,12 @@ static int nfn;
  * each use is noted in gfix and filled in at the end. A negative gfix_off means an
  * offset into the zeroed part, counted as -1 - offset. */
 static char gname[256][32];
-static int goff[256], gbss[256], nglob, gbss_size;
+static int gtype[256], goff[256], gbss[256], nglob, gbss_size;
 static u32 gfix_at[4096];
 static int gfix_off[4096], ngfix;
 static u32 fcall_at[256];
 static int fcall_fn[256], nfcall;
-static int curvoid;                     /* is the function being compiled void? */
+static int curtype;                     /* the return type of the function being compiled */
 static char name[32];                   /* the name ident() just read */
 static char *p;
 
@@ -171,28 +179,38 @@ static void where(int r) {
     emit32(0);
 }
 
-/* These copy a variable into eax and back. */
-static void load(int r)  { emit(0x8b); where(r); }                          /* eax = the variable */
-static void store(int r) { emit(0x89); where(r); }                          /* the variable = eax */
+/* The type of variable r. */
+static int type_of(int r) { return r >= 0 ? vtype[r] : gtype[-1 - r]; }
+
+/* A 64 bit operation needs a prefix byte (REX.W) in front of the instruction, and
+ * a 32 bit one doesn't. */
+static void rex(int type) { if (type == LONG) emit(0x48); }
+
+/* These copy a variable into eax (or rax, for a long) and back. */
+static void load(int r)  { rex(type_of(r)); emit(0x8b); where(r); }         /* eax = the variable */
+static void store(int r) { rex(type_of(r)); emit(0x89); where(r); }         /* the variable = eax */
 
 /* ++ and -- change the variable in memory directly, leaving eax alone. */
 static void add_const(int r, int amount) {                                   /* the variable += amount (1 or -1) */
-    emit(0x83); where(r); emit(amount & 0xff);
+    rex(type_of(r)); emit(0x83); where(r); emit(amount & 0xff);
 }
 
-/* The compound assignments: variable = variable op eax, where op is one of + - * / % */
-static void modify(int i, int op) {
-    if (op == '+') { emit(0x01); where(i); }                                 /* add [variable], eax */
-    else if (op == '-') { emit(0x29); where(i); }                            /* sub [variable], eax */
+/* The compound assignments: variable = variable op eax, where op is one of + - * / %
+ * The value in eax has already been converted to the variable's type. */
+static void modify(int r, int op) {
+    int t = type_of(r);
+    if (op == '+') { rex(t); emit(0x01); where(r); }                         /* add [variable], eax */
+    else if (op == '-') { rex(t); emit(0x29); where(r); }                    /* sub [variable], eax */
     else if (op == '*') {
-        emit(0x0f); emit(0xaf); where(i);                                    /* eax = eax * variable */
-        store(i);
+        rex(t); emit(0x0f); emit(0xaf); where(r);                            /* eax = eax * variable */
+        store(r);
     } else {                                                                 /* / and %: the variable is the dividend */
-        emit(0x89); emit(0xc1);                                              /* ecx = eax, the divisor */
-        load(i);
-        emit(0x99); emit(0xf7); emit(0xf9);                                  /* cdq, idiv ecx */
-        if (op == '%') { emit(0x89); emit(0xd0); }                           /* remainder: eax = edx */
-        store(i);
+        rex(t); emit(0x89); emit(0xc1);                                      /* ecx = eax, the divisor */
+        load(r);
+        rex(t); emit(0x99);                                                  /* cdq, or cqo for a long */
+        rex(t); emit(0xf7); emit(0xf9);                                      /* idiv ecx */
+        if (op == '%') { rex(t); emit(0x89); emit(0xd0); }                   /* remainder: eax = edx */
+        store(r);
     }
 }
 
@@ -203,43 +221,75 @@ static void leave(void) {
     emit(0xc3);                                         /* return */
 }
 
-/* Machine code for putn: prints the number in eax, then a newline.
- * It is added to the end of the program once, and every putn(...) calls it. */
+/* Machine code for putn: prints the 64 bit number in rax, then a newline.
+ * It is added to the end of the program once, and every putn(...) calls it.
+ * The number is divided by 10 as an unsigned value, so even the most negative
+ * long (which can't be negated) comes out right. */
 static u8 putn_code[] = {
-    0x48,0x83,0xec,0x10,             /* make a 16 byte buffer on the stack */
-    0x48,0x8d,0x7c,0x24,0x0f,        /* rdi = last byte of the buffer */
+    0x48,0x83,0xec,0x20,             /* make a 32 byte buffer on the stack */
+    0x48,0x8d,0x7c,0x24,0x1f,        /* rdi = last byte of the buffer */
     0xc6,0x07,0x0a,                  /* put a newline there */
     0x31,0xf6,                       /* esi = 0 (will be 1 if negative) */
-    0x85,0xc0,                       /* if eax is negative: */
-    0x79,0x04,
-    0xf7,0xd8,                       /*   eax = -eax */
+    0x48,0x85,0xc0,                  /* if rax is negative: */
+    0x79,0x05,
+    0x48,0xf7,0xd8,                  /*   rax = -rax */
     0xff,0xc6,                       /*   esi = 1 */
     0xb9,0x0a,0x00,0x00,0x00,        /* ecx = 10 */
     /* loop: one digit each time, working from the right */
     0x31,0xd2,                       /* edx = 0 */
-    0xf7,0xf1,                       /* eax = eax / 10, edx = remainder */
+    0x48,0xf7,0xf1,                  /* rax = rax / 10, rdx = remainder */
     0x80,0xc2,0x30,                  /* dl = dl + '0' */
     0x48,0xff,0xcf,                  /* rdi = rdi - 1 */
     0x88,0x17,                       /* store the digit */
-    0x85,0xc0,                       /* go round again until eax is 0 */
-    0x75,0xf0,
+    0x48,0x85,0xc0,                  /* go round again until rax is 0 */
+    0x75,0xee,
     0x85,0xf6,                       /* if it was negative: */
     0x74,0x06,
     0x48,0xff,0xcf,                  /*   rdi = rdi - 1 */
     0xc6,0x07,0x2d,                  /*   store '-' */
-    0x48,0x8d,0x54,0x24,0x10,        /* rdx = end of the buffer */
+    0x48,0x8d,0x54,0x24,0x20,        /* rdx = end of the buffer */
     0x48,0x29,0xfa,                  /* rdx = rdx - rdi (the length) */
     0x48,0x89,0xfe,                  /* rsi = rdi (the start) */
     0xbf,0x01,0x00,0x00,0x00,        /* edi = 1 (stdout) */
     0xb8,0x01,0x00,0x00,0x00,        /* eax = 1 (write) */
     0x0f,0x05,                       /* syscall */
-    0x48,0x83,0xc4,0x10,             /* give the buffer back */
+    0x48,0x83,0xc4,0x20,             /* give the buffer back */
     0xc3,                            /* return */
 };
 
-/* Expressions. Every function leaves its answer in eax.
- * For "a op b": work out a, push it, work out b, move b to ecx, pop a, do the op. */
-static void expr(void);
+/* Expressions. Each function leaves its answer in eax (or rax, for a long) and
+ * returns the type of that answer, so the caller knows which it is.
+ * For "a op b": work out a, push it, work out b, move b to ecx, pop a, do the op.
+ * If one side is an int and the other a long, the int is widened first, as in C. */
+static int expr(void);
+
+/* Widen the int in eax to a long in rax (sign extending it). */
+static void to_long(void) { emit(0x48); emit(0x98); }
+
+/* Is the value in eax (or rax) zero? Sets the flags for a conditional jump or set. */
+static void test_value(int type) { rex(type); emit(0x85); emit(0xc0); }
+
+/* Both sides of an operator are worked out and sit in rax (the left, of type tl)
+ * and rcx (the right, of type tr). Widens whichever is an int if the other is a
+ * long, and gives the type the operation will be done in. */
+static int common(int tl, int tr) {
+    if (tl != LONG && tr != LONG) return INT;
+    if (tl == INT) to_long();
+    if (tr == INT) { emit(0x48); emit(0x63); emit(0xc9); }   /* rcx = ecx, sign extended */
+    return LONG;
+}
+
+/* eax = eax op ecx, where op is one of + - * / % */
+static void arith(int op, int t) {
+    if (op == '+') { rex(t); emit(0x01); emit(0xc8); }
+    else if (op == '-') { rex(t); emit(0x29); emit(0xc8); }
+    else if (op == '*') { rex(t); emit(0x0f); emit(0xaf); emit(0xc1); }
+    else {
+        rex(t); emit(0x99);                                 /* cdq, or cqo for a long */
+        rex(t); emit(0xf7); emit(0xf9);                     /* idiv ecx: quotient in eax, remainder in edx */
+        if (op == '%') { rex(t); emit(0x89); emit(0xd0); }  /* for %, eax = edx */
+    }
+}
 
 /* The character a backslash escape stands for, in a string or a 'c' literal.
  * Called with p just past the backslash. \\ \' and \" are themselves. */
@@ -268,14 +318,17 @@ static int find_fn(void) {
 }
 
 /* Code for a call to function f, called just after its "(". The arguments are
- * worked out left to right and pushed, so the last one ends up nearest the top of
- * the stack. The result comes back in eax. The caller drops the arguments again. */
-static void call(int f) {
+ * worked out left to right, converted to the parameter's type, and pushed, so the
+ * last one ends up nearest the top of the stack. The result comes back in eax, and
+ * the type it has is returned. The caller drops the arguments again. */
+static int call(int f) {
     int n = 0;
     if (!eat(")")) {
         do {
             if (n == 12) die("too many arguments", 0);
-            expr(); emit(0x50); n++;
+            int t = expr();
+            if (n < fparams[f] && fptype[f][n] == LONG && t == INT) to_long();
+            emit(0x50); n++;
         } while (eat(","));
         expect(")");
     }
@@ -283,12 +336,15 @@ static void call(int f) {
     if (nfcall == 256) die("too many calls", 0);
     emit(0xe8); fcall_at[nfcall] = nc; fcall_fn[nfcall++] = f; emit32(0);   /* address filled in once all functions are defined */
     if (n) { emit(0x48); emit(0x83); emit(0xc4); emit(8 * n); }              /* rsp += 8 * n */
+    return ftype[f];
 }
 
 /* A number (decimal or hex like 0x1F) or a character like 'a', which is just the
- * number 97. Gives its value. */
-static u32 literal(void) {
-    u32 v = 0;
+ * number 97. Gives its value, and its type in *type: an int if it fits in one,
+ * otherwise a long. */
+static u64 literal(int *type) {
+    u64 v = 0;
+    *type = INT;
     if (*p == '\'') {
         p++;
         if (*p == '\'' || *p == '\n' || !*p) die("bad character literal", 0);
@@ -303,92 +359,112 @@ static u32 literal(void) {
         if (hexval(*p) < 0) die("expected hex digits", 0);
         while (hexval(*p) >= 0) v = v * 16 + hexval(*p++);
     } else while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+    if (v > 0x7fffffff) *type = LONG;
     return v;
 }
 
-static void factor(void) {
+/* Put a 64 bit number into the code. */
+static void emit64(u64 v) { emit32(v); emit32(v >> 32); }
+
+static int factor(void) {
     ws();
-    if (eat("(")) { expr(); expect(")"); }
-    else if (eat("++")) { ident(); int i = lookup(); add_const(i, 1); load(i); }    /* ++x: the new value */
-    else if (eat("--")) { ident(); int i = lookup(); add_const(i, -1); load(i); }
-    else if (eat("-")) { factor(); emit(0xf7); emit(0xd8); }       /* neg eax (after -- so "--x" isn't read as two minuses) */
-    else if (eat("!")) {                                            /* 1 if it was zero, otherwise 0 */
-        factor();
-        emit(0x85); emit(0xc0);                                     /* is eax zero? */
+    if (eat("(")) { int t = expr(); expect(")"); return t; }
+    if (eat("++")) { ident(); int i = lookup(); add_const(i, 1); load(i); return type_of(i); }   /* ++x: the new value */
+    if (eat("--")) { ident(); int i = lookup(); add_const(i, -1); load(i); return type_of(i); }
+    if (eat("-")) {                                                 /* after -- so "--x" isn't read as two minuses */
+        int t = factor();
+        rex(t); emit(0xf7); emit(0xd8);                             /* eax = -eax */
+        return t;
+    }
+    if (eat("!")) {                                                 /* 1 if it was zero, otherwise 0 */
+        int t = factor();
+        test_value(t);                                              /* is it zero? */
         emit(0x0f); emit(0x94); emit(0xc0);                         /* al = 1 if it was, otherwise 0 */
         emit(0x0f); emit(0xb6); emit(0xc0);                         /* eax = al */
+        return INT;
     }
-    else if ((*p >= '0' && *p <= '9') || *p == '\'') { emit(0xb8); emit32(literal()); }   /* eax = the number */
-    else if (isw(*p)) {
+    if ((*p >= '0' && *p <= '9') || *p == '\'') {
+        int t;
+        u64 v = literal(&t);
+        if (t == LONG) { emit(0x48); emit(0xb8); emit64(v); }       /* rax = the number */
+        else { emit(0xb8); emit32(v); }                             /* eax = the number */
+        return t;
+    }
+    if (isw(*p)) {
         ident();
         if (eat("(")) {                                             /* a call, like f(a, b) */
             int f = find_fn();
             if (f < 0) die("undeclared function", name);
-            if (fvoid[f]) die("void function used as a value", name);
-            call(f);
-        } else {                                                    /* a variable, maybe with x++ or x-- */
-            int i = lookup();
-            load(i);                                                /* eax = the old value, which x++ gives back */
-            if (eat("++")) add_const(i, 1); else if (eat("--")) add_const(i, -1);
+            if (ftype[f] == VOID) die("void function used as a value", name);
+            return call(f);
         }
+        int i = lookup();                                           /* a variable, maybe with x++ or x-- */
+        load(i);                                                    /* eax = the old value, which x++ gives back */
+        if (eat("++")) add_const(i, 1); else if (eat("--")) add_const(i, -1);
+        return type_of(i);
     }
-    else die("expected expression", 0);
+    die("expected expression", 0);
+    return INT;
 }
 
-static void term(void) {
-    factor();
+static int term(void) {                 /* * / % */
+    int tl = factor();
     for (;;) {
         int op;
-        if (eat("*")) op = 0; else if (eat("/")) op = 1; else if (eat("%")) op = 2; else return;
-        emit(0x50); factor(); emit(0x89); emit(0xc1); emit(0x58);   /* push, right side, ecx = eax, pop */
-        if (op == 0) { emit(0x0f); emit(0xaf); emit(0xc1); }        /* imul eax, ecx */
-        else {
-            emit(0x99); emit(0xf7); emit(0xf9);                     /* cdq, idiv ecx */
-            if (op == 2) { emit(0x89); emit(0xd0); }                /* remainder: eax = edx */
-        }
+        if (eat("*")) op = '*'; else if (eat("/")) op = '/'; else if (eat("%")) op = '%'; else return tl;
+        emit(0x50); int tr = factor();
+        emit(0x48); emit(0x89); emit(0xc1); emit(0x58);             /* push left, do right, rcx = rax, pop left */
+        tl = common(tl, tr);
+        arith(op, tl);
     }
 }
 
-static void sum(void) {                 /* + and - */
-    term();
+static int sum(void) {                  /* + and - */
+    int tl = term();
     for (;;) {
-        int sub;
-        if (eat("+")) sub = 0; else if (eat("-")) sub = 1; else return;
-        emit(0x50); term(); emit(0x89); emit(0xc1); emit(0x58);     /* push, right side, ecx = eax, pop */
-        if (sub) { emit(0x29); emit(0xc8); }                        /* sub eax, ecx */
-        else { emit(0x01); emit(0xc8); }                            /* add eax, ecx */
+        int op;
+        if (eat("+")) op = '+'; else if (eat("-")) op = '-'; else return tl;
+        emit(0x50); int tr = term();
+        emit(0x48); emit(0x89); emit(0xc1); emit(0x58);             /* push left, do right, rcx = rax, pop left */
+        tl = common(tl, tr);
+        arith(op, tl);
     }
 }
 
-/* Comparisons give 1 for true and 0 for false, like C. They work the same way as
- * + and -, except for the last step: compare eax with ecx, then set eax to 1 or 0
- * depending on the result. setcc picks which test to use (equal, less than...). */
-static void compare(int setcc) {
-    emit(0x39); emit(0xc8);             /* compare eax with ecx */
+/* Comparisons give 1 for true and 0 for false, like C, and that's an int whatever
+ * the sides were. They work the same way as + and -, except for the last step:
+ * compare eax with ecx, then set eax to 1 or 0 depending on the result. setcc
+ * picks which test to use (equal, less than...). */
+static void compare(int setcc, int t) {
+    rex(t); emit(0x39); emit(0xc8);     /* compare eax with ecx */
     emit(0x0f); emit(setcc); emit(0xc0);/* al = 1 if the test passed, otherwise 0 */
     emit(0x0f); emit(0xb6); emit(0xc0); /* eax = al, so the rest of eax is 0 */
 }
 
 /* < > <= >= bind tighter than == and !=, same as in C. The two character ones
  * are checked first, otherwise "<" would grab the front of "<=". */
-static void relation(void) {
-    sum();
+static int relation(void) {
+    int tl = sum();
     for (;;) {
         int cc;
         if (eat("<=")) cc = 0x9e; else if (eat(">=")) cc = 0x9d;
-        else if (eat("<")) cc = 0x9c; else if (eat(">")) cc = 0x9f; else return;
-        emit(0x50); sum(); emit(0x89); emit(0xc1); emit(0x58);      /* push, right side, ecx = eax, pop */
-        compare(cc);
+        else if (eat("<")) cc = 0x9c; else if (eat(">")) cc = 0x9f; else return tl;
+        emit(0x50); int tr = sum();
+        emit(0x48); emit(0x89); emit(0xc1); emit(0x58);             /* push left, do right, rcx = rax, pop left */
+        compare(cc, common(tl, tr));
+        tl = INT;
     }
 }
 
-static void equality(void) {            /* == != */
-    relation();
+static int equality(void) {             /* == != */
+    int tl = relation();
     for (;;) {
         int cc;
-        if (eat("==")) cc = 0x94; else if (eat("!=")) cc = 0x95; else return;
-        emit(0x50); relation(); emit(0x89); emit(0xc1); emit(0x58);
-        compare(cc);
+        if (eat("==")) cc = 0x94; else if (eat("!=")) cc = 0x95; else return tl;
+        emit(0x50); int tr = relation();
+        emit(0x48); emit(0x89); emit(0xc1); emit(0x58);
+        compare(cc, common(tl, tr));
+        tl = INT;
     }
 }
 
@@ -410,61 +486,69 @@ static void here(int at) {
 /* && and || short-circuit, so they skip the push/pop recipe and use jumps: each
  * operand is tested, and one that settles the result jumps to the end. The
  * result is normalised to 1 or 0. A chain keeps its pending jumps in a list. */
-static void logical_and(void) {
-    equality();
-    if (!eat("&&")) return;
+static int logical_and(void) {
+    int t = equality();
+    if (!eat("&&")) return t;
     int miss[33], n = 0;
     do {
-        emit(0x85); emit(0xc0);                         /* is eax zero? */
+        test_value(t);                                  /* is it zero? */
         if (n == 32) die("too many && in a row", 0);
         miss[n++] = jump_if_zero();                     /* yes: the whole thing is false */
-        equality();
+        t = equality();
     } while (eat("&&"));
-    emit(0x85); emit(0xc0);
+    test_value(t);
     miss[n++] = jump_if_zero();
     emit(0xb8); emit32(1);                              /* every part was true: eax = 1 */
     int done = jump();
     for (int i = 0; i < n; i++) here(miss[i]);
     emit(0x31); emit(0xc0);                             /* eax = 0 */
     here(done);
+    return INT;
 }
 
 /* == and != are not the loosest any more: && and || are, so this is the top,
  * a whole expression. || is looser than &&, as in C. */
-static void expr(void) {
-    logical_and();
-    if (!eat("||")) return;
+static int expr(void) {
+    int t = logical_and();
+    if (!eat("||")) return t;
     int hit[33], n = 0;
     do {
-        emit(0x85); emit(0xc0);                         /* is eax zero? */
+        test_value(t);                                  /* is it zero? */
         if (n == 32) die("too many || in a row", 0);
         hit[n++] = jump_if_nonzero();                   /* no: the whole thing is true */
-        logical_and();
+        t = logical_and();
     } while (eat("||"));
-    emit(0x85); emit(0xc0);
+    test_value(t);
     hit[n++] = jump_if_nonzero();
     emit(0x31); emit(0xc0);                             /* every part was false: eax = 0 */
     int done = jump();
     for (int i = 0; i < n; i++) here(hit[i]);
     emit(0xb8); emit32(1);                              /* eax = 1 */
     here(done);
+    return INT;
 }
 
 /* The two kinds of statement that a for loop can have in its brackets, so they're
  * parsed without the closing ";". */
 
-/* x  or  x = <expression>  (after "int"). Reserves a slot for the name. A bare
- * "int x;" makes no code, so the slot keeps whatever was there, as in C. A name can
- * only clash with one from the same block, so an inner block may reuse an outer name. */
-static void declare(void) {
+/* x  or  x = <expression>  (after "int" or "long"). Reserves a slot for the name. A
+ * bare "int x;" makes no code, so the slot keeps whatever was there, as in C. A name
+ * can only clash with one from the same block, so an inner block may reuse an outer
+ * name. The starting value is converted to the variable's type. */
+static void declare(int type) {
     ident();
     if (find(scope) >= 0) die("already declared", name);
     if (nvar == 64) die("too many variables", 0);
     int i = nvar++;
     if (nvar - nparams > maxvar) maxvar = nvar - nparams;
     for (int j = 0; j < 32; j++) vname[i][j] = name[j];
-    voff[i] = -4 * (i - nparams + 1);                   /* locals sit below rbp, after the parameters in the table */
-    if (eat("=")) { expr(); store(i); }
+    vtype[i] = type;
+    voff[i] = -8 * (i - nparams + 1);                   /* locals sit below rbp, after the parameters in the table */
+    if (eat("=")) {
+        int t = expr();
+        if (type == LONG && t == INT) to_long();
+        store(i);
+    }
 }
 
 /* x = e   x += e   x -= e   x *= e   x /= e   x %= e   x++   x--   ++x   --x
@@ -489,8 +573,10 @@ static void simple(void) {
             int op = 0;
             if (eat("+=")) op = '+'; else if (eat("-=")) op = '-'; else if (eat("*=")) op = '*';
             else if (eat("/=")) op = '/'; else if (eat("%=")) op = '%';
-            if (op) { expr(); modify(i, op); }
-            else { expect("="); expr(); store(i); }
+            if (!op) expect("=");
+            int t = expr();
+            if (type_of(i) == LONG && t == INT) to_long();      /* the value takes the variable's type */
+            if (op) modify(i, op); else store(i);
         }
     }
 }
@@ -514,12 +600,16 @@ static void stmt(void) {
         emit(0xba); emit32(nd - start); /* edx = length */
         emit(0x0f); emit(0x05);         /* syscall */
     } else if (eat("putn")) {
-        expect("("); expr(); expect(")"); expect(";");
+        expect("("); int t = expr(); expect(")"); expect(";");
+        if (t == INT) to_long();                        /* putn prints a 64 bit number */
         if (ncall == 64) die("too many putn calls", 0);
         emit(0xe8); call_at[ncall++] = nc; emit32(0);   /* call putn, address filled in later */
     } else if (eat("return")) {
         /* return expression;  or just  return;  in a void function */
-        if (!curvoid) expr();
+        if (curtype != VOID) {
+            int t = expr();
+            if (curtype == LONG && t == INT) to_long();
+        }
         expect(";");
         leave();
     } else if (eat("{")) {
@@ -534,8 +624,8 @@ static void stmt(void) {
          * Zero counts as false and anything else as true. The code tests eax and
          * jumps over the "if" part when it's zero. With an "else", the "if" part
          * ends with a second jump that skips over the "else" part. */
-        expect("("); expr(); expect(")");
-        emit(0x85); emit(0xc0);                         /* is eax zero? */
+        expect("("); int t = expr(); expect(")");
+        test_value(t);                                  /* is it zero? */
         int skip = jump_if_zero();
         stmt();
         if (eat("else")) {
@@ -550,8 +640,8 @@ static void stmt(void) {
          * condition, so it gets tested again. When the condition finally comes
          * out as zero, the jump at the top skips past the whole loop. */
         int top = nc;
-        expect("("); expr(); expect(")");
-        emit(0x85); emit(0xc0);                         /* is eax zero? */
+        expect("("); int t = expr(); expect(")");
+        test_value(t);                                  /* is it zero? */
         int skip = jump_if_zero();
         stmt();
         jump_back(top);
@@ -572,13 +662,13 @@ static void stmt(void) {
         scope = nvar;
         expect("(");
         if (!eat(";")) {
-            if (eat("int")) declare(); else simple();
+            if (eat("int")) declare(INT); else if (eat("long")) declare(LONG); else simple();
             expect(";");
         }
         int top = nc, skip = -1;
         if (!eat(";")) {
-            expr(); expect(";");
-            emit(0x85); emit(0xc0);                     /* is eax zero? */
+            int t = expr(); expect(";");
+            test_value(t);                              /* is it zero? */
             skip = jump_if_zero();
         }
         int to_body = jump();
@@ -591,7 +681,10 @@ static void stmt(void) {
         if (skip >= 0) here(skip);
         nvar = saved; scope = outer;
     } else if (eat("int")) {
-        declare();
+        declare(INT);
+        expect(";");
+    } else if (eat("long")) {
+        declare(LONG);
         expect(";");
     } else {
         simple();
@@ -600,50 +693,57 @@ static void stmt(void) {
 }
 
 static char pname[12][32];              /* parameter names, empty if a prototype leaves them out */
+static int ptype[12];                   /* and their types */
 
 /* One thing at the top level of the file: a global variable, a function
  * definition, or a prototype ending in ";" (which lets earlier code call a
  * function that's defined further down). */
 static void toplevel(void) {
     eat("static");                                      /* accepted and ignored: everything is file-local anyway */
-    int isvoid = 0;
-    if (eat("int")) isvoid = 0; else if (eat("void")) isvoid = 1; else die("expected a function or a variable", 0);
+    int rtype = INT;
+    if (eat("int")) rtype = INT; else if (eat("long")) rtype = LONG; else if (eat("void")) rtype = VOID;
+    else die("expected a function or a variable", 0);
     ident();
     char fn[32];
     for (int j = 0; j < 32; j++) fn[j] = name[j];
 
     if (!eat("(")) {                                    /* no bracket, so it's a global variable */
-        if (isvoid) die("a variable can't be void", fn);
+        if (rtype == VOID) die("a variable can't be void", fn);
         if (find_global(fn) >= 0) die("already defined", fn);
         for (int i = 0; i < nfn; i++) if (same(fname[i], fn)) die("already defined", fn);
         if (nglob == 256) die("too many globals", 0);
         int g = nglob++;
         for (int j = 0; j < 32; j++) gname[g][j] = fn[j];
+        gtype[g] = rtype;
+        int size = rtype == LONG ? 8 : 4;
         if (eat("=")) {                                 /* a starting value has to be a plain constant */
             ws();
             int neg = eat("-");
             ws();
             if (!((*p >= '0' && *p <= '9') || *p == '\'')) die("expected a constant", 0);
-            u32 v = literal();
+            int lt;
+            u64 v = literal(&lt);
             if (neg) v = -v;
-            while (nd % 4) data[nd++] = 0;              /* keep it aligned */
+            while (nd % size) data[nd++] = 0;           /* keep it aligned */
             goff[g] = nd; gbss[g] = 0;
-            for (int k = 0; k < 4; k++) data[nd++] = v >> (8 * k);
+            for (int k = 0; k < size; k++) data[nd++] = v >> (8 * k);
             if (!eat(";")) die("a global's starting value can only be a single number", 0);
             return;
         }
-        goff[g] = gbss_size; gbss[g] = 1; gbss_size += 4;
+        while (gbss_size % size) gbss_size++;
+        goff[g] = gbss_size; gbss[g] = 1; gbss_size += size;
         expect(";");
         return;
     }
     if (find_global(fn) >= 0) die("already defined", fn);
 
-    int n = 0;                                          /* the parameters: (), (void), or ints with optional names */
+    int n = 0;                                          /* the parameters: (), (void), or typed, with optional names */
     if (eat("void")) expect(")");
     else if (!eat(")")) {
         do {
             if (n == 12) die("too many parameters", 0);
-            expect("int");
+            if (eat("int")) ptype[n] = INT; else if (eat("long")) ptype[n] = LONG;
+            else die("expected a parameter type", 0);
             ws();
             if (isw(*p)) { ident(); for (int j = 0; j < 32; j++) pname[n][j] = name[j]; }
             else pname[n][0] = 0;
@@ -655,12 +755,15 @@ static void toplevel(void) {
     int f = -1;                                         /* a prototype and the definition must agree */
     for (int i = 0; i < nfn; i++) if (same(fname[i], fn)) f = i;
     if (f >= 0) {
-        if (fparams[f] != n || fvoid[f] != isvoid) die("conflicting declaration of", fn);
+        int same_types = ftype[f] == rtype && fparams[f] == n;
+        for (int k = 0; same_types && k < n; k++) if (fptype[f][k] != ptype[k]) same_types = 0;
+        if (!same_types) die("conflicting declaration of", fn);
     } else {
         if (nfn == 32) die("too many functions", 0);
         f = nfn++;
         for (int j = 0; j < 32; j++) fname[f][j] = fn[j];
-        fparams[f] = n; fvoid[f] = isvoid; faddr[f] = -1;
+        ftype[f] = rtype; fparams[f] = n; faddr[f] = -1;
+        for (int k = 0; k < n; k++) fptype[f][k] = ptype[k];
     }
     if (eat(";")) return;
 
@@ -671,12 +774,13 @@ static void toplevel(void) {
     /* Start of the function: the parameters become its first variables. Then room
      * is made on the stack for the locals. How many there are isn't known until
      * the whole function has been read, so the amount is left blank for now. */
-    nvar = 0; scope = 0; maxvar = 0; nparams = n; curvoid = isvoid;
+    nvar = 0; scope = 0; maxvar = 0; nparams = n; curtype = rtype;
     for (int k = 0; k < n; k++) {
         if (!pname[k][0]) die("parameter needs a name", 0);
         for (int j = 0; j < 32; j++) name[j] = pname[k][j];
         if (find(0) >= 0) die("already declared", name);
         for (int j = 0; j < 32; j++) vname[nvar][j] = name[j];
+        vtype[nvar] = ptype[k];
         voff[nvar++] = 16 + 8 * (n - 1 - k);            /* pushed first means furthest from rbp */
     }
     emit(0x55);                                         /* save rbp */
@@ -686,7 +790,7 @@ static void toplevel(void) {
     while (!eat("}")) stmt();
     emit(0x31); emit(0xc0);                             /* running off the end returns 0, which is what main needs */
     leave();
-    u32 frame = (maxvar * 4 + 15) & ~15;                /* 4 bytes each, rounded up to a multiple of 16 */
+    u32 frame = (maxvar * 8 + 15) & ~15;                /* 8 bytes each, rounded up to a multiple of 16 */
     for (int k = 0; k < 4; k++) code[frame_at + k] = frame >> (8 * k);
 }
 
@@ -702,7 +806,7 @@ static int qmain(int argc, char **argv) {
     /* The program starts with a few instructions that call main and then exit with
      * whatever it returned, so main is an ordinary function. main is function 0. */
     for (int j = 0; "main"[j]; j++) fname[0][j] = "main"[j];
-    nfn = 1; faddr[0] = -1;
+    nfn = 1; ftype[0] = INT; faddr[0] = -1;
     emit(0xe8); fcall_at[nfcall] = nc; fcall_fn[nfcall++] = 0; emit32(0);   /* call main */
     emit(0x89); emit(0xc7);                             /* edi = eax, the exit code */
     emit(0xb8); emit32(60);                             /* eax = 60 (exit) */

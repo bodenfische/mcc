@@ -21,7 +21,7 @@ run() {
 check() {
     ok=1
     ./mcc "$3" "$tmp/t" && [ "$(run "$tmp/t")" = "$2" ] || ok=0
-    gcc -w -include stdio.h '-Dputn(x)=printf("%d\n",(x))' -o "$tmp/g" "$3" \
+    gcc -w -include stdio.h '-Dputn(x)=printf("%ld\n",(long)(x))' -o "$tmp/g" "$3" \
         && [ "$(run "$tmp/g")" = "$2" ] || ok=0
     if [ "$ok" = 1 ]; then
         echo "ok   $1"; pass=$((pass + 1))
