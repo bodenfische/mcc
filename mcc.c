@@ -22,10 +22,15 @@ static u32 patch_at[64], patch_str[64];
 static u32 call_at[64];
 static int ncall;
 
-/* Types. A type is one of these numbers. int is 32 bits and long is 64. */
+/* Types. A type is one of these numbers. int is 32 bits and long is 64. A pointer
+ * adds 4 for each level of *, so int * is 5, long * is 6 and int ** is 9. */
 static int VOID = 0;
 static int INT = 1;
 static int LONG = 2;
+static int is_ptr(int t) { return t >= 4; }
+static int deref(int t) { return t - 4; }                   /* what a pointer points at */
+static int wide(int t) { return t == LONG || t >= 4; }      /* held in all 64 bits of rax */
+static int size_of(int t) { return t == INT ? 4 : 8; }
 
 /* Variables are found by their position in this table: vname holds the names,
  * vtype the types, voff where each one sits relative to rbp, and nvar says how
@@ -184,7 +189,7 @@ static int type_of(int r) { return r >= 0 ? vtype[r] : gtype[-1 - r]; }
 
 /* A 64 bit operation needs a prefix byte (REX.W) in front of the instruction, and
  * a 32 bit one doesn't. */
-static void rex(int type) { if (type == LONG) emit(0x48); }
+static void rex(int type) { if (wide(type)) emit(0x48); }
 
 /* These copy a variable into eax (or rax, for a long) and back. */
 static void load(int r)  { rex(type_of(r)); emit(0x8b); where(r); }         /* eax = the variable */
@@ -192,7 +197,9 @@ static void store(int r) { rex(type_of(r)); emit(0x89); where(r); }         /* t
 
 /* ++ and -- change the variable in memory directly, leaving eax alone. */
 static void add_const(int r, int amount) {                                   /* the variable += amount (1 or -1) */
-    rex(type_of(r)); emit(0x83); where(r); emit(amount & 0xff);
+    int t = type_of(r);
+    if (is_ptr(t)) amount *= size_of(deref(t));                              /* a pointer moves a whole element */
+    rex(t); emit(0x83); where(r); emit(amount & 0xff);
 }
 
 /* The compound assignments: variable = variable op eax, where op is one of + - * / %
@@ -291,6 +298,68 @@ static void arith(int op, int t) {
     }
 }
 
+/* Was the code from start onwards just the constant 0? That's the one integer a
+ * pointer may be set to or compared with. */
+static int is_zero_const(int start) {
+    if (nc - start != 5 || code[start] != 0xb8) return 0;
+    for (int i = 1; i < 5; i++) if (code[start + i]) return 0;
+    return 1;
+}
+
+/* The value in rax has type from, and is being put somewhere of type to (a
+ * variable, a parameter, a return value). start is where its code began. An int
+ * widens to a long and a long just loses its top half. A pointer only goes into
+ * the same kind of pointer, or takes a plain 0. */
+static void convert(int from, int to, int start) {
+    if (from == to) return;
+    if (is_ptr(to) && from == INT && is_zero_const(start)) return;   /* mov eax, 0 already cleared the top half */
+    if (is_ptr(to) && is_ptr(from)) die("incompatible pointer types", 0);
+    if (is_ptr(to) || is_ptr(from)) die("can't mix a pointer and an integer", 0);
+    if (to == LONG) to_long();
+}
+
+/* Multiply the integer in rax by the size of what pointer type t points at, by
+ * shifting (every size is 4 or 8). An int is widened first. */
+static void scale(int from, int t) {
+    if (is_ptr(from)) die("can't add two pointers", 0);
+    if (from == INT) to_long();
+    emit(0x48); emit(0xc1); emit(0xe0); emit(size_of(deref(t)) == 4 ? 2 : 3);   /* shl rax, 2 or 3 */
+}
+
+/* "a + b" or "a - b" with a pointer on at least one side, left in rax and right in
+ * rcx. A pointer plus or minus an integer moves by whole elements, and two pointers
+ * of the same type subtract to a count of elements. Gives the type of the answer. */
+static int ptr_arith(int op, int tl, int tr) {
+    if (is_ptr(tl) && is_ptr(tr)) {
+        if (op != '-') die("can't add two pointers", 0);
+        if (tl != tr) die("incompatible pointer types", 0);
+        emit(0x48); emit(0x29); emit(0xc8);                                   /* rax = rax - rcx */
+        emit(0x48); emit(0xc1); emit(0xf8); emit(size_of(deref(tl)) == 4 ? 2 : 3);   /* sar rax, 2 or 3 */
+        return LONG;
+    }
+    if (is_ptr(tl)) {
+        if (tr == INT) { emit(0x48); emit(0x63); emit(0xc9); }               /* rcx = ecx, sign extended */
+        emit(0x48); emit(0xc1); emit(0xe1); emit(size_of(deref(tl)) == 4 ? 2 : 3);   /* shl rcx, 2 or 3 */
+        emit(0x48); emit(op == '+' ? 0x01 : 0x29); emit(0xc8);
+        return tl;
+    }
+    if (op != '+') die("can't subtract a pointer from an integer", 0);
+    scale(tl, tr);                                                           /* shl rax */
+    emit(0x48); emit(0x01); emit(0xc8);
+    return tr;
+}
+
+/* Both sides of a comparison are in rax and rcx. Pointers can be compared with a
+ * pointer of the same type or a plain 0. Gives the type to compare in. lnull and
+ * rnull say whether a side was just the constant 0. */
+static int compare_type(int tl, int tr, int lnull, int rnull) {
+    if (!is_ptr(tl) && !is_ptr(tr)) return common(tl, tr);
+    if (tl == tr) return LONG;
+    if ((is_ptr(tl) && tr == INT && rnull) || (is_ptr(tr) && tl == INT && lnull)) return LONG;
+    die("can't compare a pointer with that", 0);
+    return LONG;
+}
+
 /* The character a backslash escape stands for, in a string or a 'c' literal.
  * Called with p just past the backslash. \\ \' and \" are themselves. */
 static int escape(void) {
@@ -326,8 +395,9 @@ static int call(int f) {
     if (!eat(")")) {
         do {
             if (n == 12) die("too many arguments", 0);
+            int start = nc;
             int t = expr();
-            if (n < fparams[f] && fptype[f][n] == LONG && t == INT) to_long();
+            if (n < fparams[f]) convert(t, fptype[f][n], start);
             emit(0x50); n++;
         } while (eat(","));
         expect(")");
@@ -373,8 +443,22 @@ static int factor(void) {
     if (eat("--")) { ident(); int i = lookup(); add_const(i, -1); load(i); return type_of(i); }
     if (eat("-")) {                                                 /* after -- so "--x" isn't read as two minuses */
         int t = factor();
+        if (is_ptr(t)) die("can't negate a pointer", 0);
         rex(t); emit(0xf7); emit(0xd8);                             /* eax = -eax */
         return t;
+    }
+    if (eat("*")) {                                                 /* *p: the value p points at */
+        int t = factor();
+        if (!is_ptr(t)) die("can't dereference something that isn't a pointer", 0);
+        int e = deref(t);
+        rex(e); emit(0x8b); emit(0x00);                             /* eax = [rax] */
+        return e;
+    }
+    if (eat("&")) {                                                 /* &x: the address of a variable */
+        ident();
+        int i = lookup();
+        emit(0x48); emit(0x8d); where(i);                           /* rax = the variable's address */
+        return type_of(i) + 4;
     }
     if (eat("!")) {                                                 /* 1 if it was zero, otherwise 0 */
         int t = factor();
@@ -414,6 +498,7 @@ static int term(void) {                 /* * / % */
         if (eat("*")) op = '*'; else if (eat("/")) op = '/'; else if (eat("%")) op = '%'; else return tl;
         emit(0x50); int tr = factor();
         emit(0x48); emit(0x89); emit(0xc1); emit(0x58);             /* push left, do right, rcx = rax, pop left */
+        if (is_ptr(tl) || is_ptr(tr)) die("can't multiply, divide or take the remainder of a pointer", 0);
         tl = common(tl, tr);
         arith(op, tl);
     }
@@ -426,6 +511,7 @@ static int sum(void) {                  /* + and - */
         if (eat("+")) op = '+'; else if (eat("-")) op = '-'; else return tl;
         emit(0x50); int tr = term();
         emit(0x48); emit(0x89); emit(0xc1); emit(0x58);             /* push left, do right, rcx = rax, pop left */
+        if (is_ptr(tl) || is_ptr(tr)) { tl = ptr_arith(op, tl, tr); continue; }
         tl = common(tl, tr);
         arith(op, tl);
     }
@@ -444,26 +530,32 @@ static void compare(int setcc, int t) {
 /* < > <= >= bind tighter than == and !=, same as in C. The two character ones
  * are checked first, otherwise "<" would grab the front of "<=". */
 static int relation(void) {
+    int start = nc;
     int tl = sum();
     for (;;) {
         int cc;
         if (eat("<=")) cc = 0x9e; else if (eat(">=")) cc = 0x9d;
         else if (eat("<")) cc = 0x9c; else if (eat(">")) cc = 0x9f; else return tl;
-        emit(0x50); int tr = sum();
+        int lnull = is_zero_const(start);
+        emit(0x50); int rstart = nc; int tr = sum();
+        int rnull = is_zero_const(rstart);
         emit(0x48); emit(0x89); emit(0xc1); emit(0x58);             /* push left, do right, rcx = rax, pop left */
-        compare(cc, common(tl, tr));
+        compare(cc, compare_type(tl, tr, lnull, rnull));
         tl = INT;
     }
 }
 
 static int equality(void) {             /* == != */
+    int start = nc;
     int tl = relation();
     for (;;) {
         int cc;
         if (eat("==")) cc = 0x94; else if (eat("!=")) cc = 0x95; else return tl;
-        emit(0x50); int tr = relation();
+        int lnull = is_zero_const(start);
+        emit(0x50); int rstart = nc; int tr = relation();
+        int rnull = is_zero_const(rstart);
         emit(0x48); emit(0x89); emit(0xc1); emit(0x58);
-        compare(cc, common(tl, tr));
+        compare(cc, compare_type(tl, tr, lnull, rnull));
         tl = INT;
     }
 }
@@ -545,9 +637,68 @@ static void declare(int type) {
     vtype[i] = type;
     voff[i] = -8 * (i - nparams + 1);                   /* locals sit below rbp, after the parameters in the table */
     if (eat("=")) {
+        int start = nc;
         int t = expr();
-        if (type == LONG && t == INT) to_long();
+        convert(t, type, start);
         store(i);
+    }
+}
+
+/* The type name at p, with any stars after it ("int", "long *"), or -1 if there
+ * isn't one. */
+static int type_name(void) {
+    int t;
+    if (eat("int")) t = INT; else if (eat("long")) t = LONG; else if (eat("void")) t = VOID; else return -1;
+    while (eat("*")) {
+        if (t == VOID) die("void pointers aren't supported yet", 0);
+        t += 4;
+    }
+    return t;
+}
+
+/* The operator of an assignment: gives '+' for +=, and so on, 0 for a plain =. */
+static int assign_op(void) {
+    int op = 0;
+    if (eat("+=")) op = '+'; else if (eat("-=")) op = '-'; else if (eat("*=")) op = '*';
+    else if (eat("/=")) op = '/'; else if (eat("%=")) op = '%';
+    if (!op) expect("=");
+    return op;
+}
+
+/* The right hand side of an assignment to something of type vt, worked out and
+ * converted into rax. += and -= on a pointer take an integer, counted in elements. */
+static void assigned_value(int vt, int op) {
+    int start = nc;
+    int t = expr();
+    if (is_ptr(vt) && (op == '+' || op == '-')) scale(t, vt);
+    else if (is_ptr(vt) && op) die("can't do that to a pointer", 0);
+    else convert(t, vt, start);
+}
+
+/* *address = e  (or += and so on): the address is worked out first and kept on the
+ * stack while the value is worked out, then both are used to update the memory. */
+static void store_through(void) {
+    int t = factor();
+    if (!is_ptr(t)) die("can't dereference something that isn't a pointer", 0);
+    int e = deref(t);
+    emit(0x50);                                         /* keep the address */
+    int op = assign_op();
+    assigned_value(e, op);
+    emit(0x59);                                         /* rcx = the address */
+    if (op == 0) { rex(e); emit(0x89); emit(0x01); }                       /* [rcx] = eax */
+    else if (op == '+') { rex(e); emit(0x01); emit(0x01); }                /* add [rcx], eax */
+    else if (op == '-') { rex(e); emit(0x29); emit(0x01); }                /* sub [rcx], eax */
+    else if (op == '*') {
+        rex(e); emit(0x0f); emit(0xaf); emit(0x01);                        /* eax = eax * [rcx] */
+        rex(e); emit(0x89); emit(0x01);
+    } else {                                                               /* / and %: [rcx] is the dividend */
+        emit(0x48); emit(0x89); emit(0xce);                                /* rsi = the address */
+        rex(e); emit(0x89); emit(0xc1);                                    /* ecx = eax, the divisor */
+        rex(e); emit(0x8b); emit(0x06);                                    /* eax = [rsi] */
+        rex(e); emit(0x99);
+        rex(e); emit(0xf7); emit(0xf9);
+        if (op == '%') { rex(e); emit(0x89); emit(0xd0); }
+        rex(e); emit(0x89); emit(0x06);                                    /* [rsi] = the result */
     }
 }
 
@@ -557,6 +708,7 @@ static void simple(void) {
     ws();
     if (eat("++")) { ident(); add_const(lookup(), 1); }
     else if (eat("--")) { ident(); add_const(lookup(), -1); }
+    else if (eat("*")) store_through();
     else {
         if (!isw(*p)) die("unsupported statement", 0);
         ident();
@@ -570,12 +722,8 @@ static void simple(void) {
         if (eat("++")) add_const(i, 1);
         else if (eat("--")) add_const(i, -1);
         else {
-            int op = 0;
-            if (eat("+=")) op = '+'; else if (eat("-=")) op = '-'; else if (eat("*=")) op = '*';
-            else if (eat("/=")) op = '/'; else if (eat("%=")) op = '%';
-            if (!op) expect("=");
-            int t = expr();
-            if (type_of(i) == LONG && t == INT) to_long();      /* the value takes the variable's type */
+            int op = assign_op();
+            assigned_value(type_of(i), op);                     /* the value takes the variable's type */
             if (op) modify(i, op); else store(i);
         }
     }
@@ -601,14 +749,16 @@ static void stmt(void) {
         emit(0x0f); emit(0x05);         /* syscall */
     } else if (eat("putn")) {
         expect("("); int t = expr(); expect(")"); expect(";");
+        if (is_ptr(t)) die("putn needs a number, not a pointer", 0);
         if (t == INT) to_long();                        /* putn prints a 64 bit number */
         if (ncall == 64) die("too many putn calls", 0);
         emit(0xe8); call_at[ncall++] = nc; emit32(0);   /* call putn, address filled in later */
     } else if (eat("return")) {
         /* return expression;  or just  return;  in a void function */
         if (curtype != VOID) {
+            int start = nc;
             int t = expr();
-            if (curtype == LONG && t == INT) to_long();
+            convert(t, curtype, start);
         }
         expect(";");
         leave();
@@ -662,7 +812,8 @@ static void stmt(void) {
         scope = nvar;
         expect("(");
         if (!eat(";")) {
-            if (eat("int")) declare(INT); else if (eat("long")) declare(LONG); else simple();
+            int t = type_name();
+            if (t > VOID) declare(t); else simple();
             expect(";");
         }
         int top = nc, skip = -1;
@@ -680,14 +831,10 @@ static void stmt(void) {
         jump_back(step);
         if (skip >= 0) here(skip);
         nvar = saved; scope = outer;
-    } else if (eat("int")) {
-        declare(INT);
-        expect(";");
-    } else if (eat("long")) {
-        declare(LONG);
-        expect(";");
     } else {
-        simple();
+        int t = type_name();
+        if (t == VOID) die("a variable can't be void", 0);
+        if (t > VOID) declare(t); else simple();
         expect(";");
     }
 }
@@ -700,9 +847,8 @@ static int ptype[12];                   /* and their types */
  * function that's defined further down). */
 static void toplevel(void) {
     eat("static");                                      /* accepted and ignored: everything is file-local anyway */
-    int rtype = INT;
-    if (eat("int")) rtype = INT; else if (eat("long")) rtype = LONG; else if (eat("void")) rtype = VOID;
-    else die("expected a function or a variable", 0);
+    int rtype = type_name();
+    if (rtype < 0) die("expected a function or a variable", 0);
     ident();
     char fn[32];
     for (int j = 0; j < 32; j++) fn[j] = name[j];
@@ -715,7 +861,7 @@ static void toplevel(void) {
         int g = nglob++;
         for (int j = 0; j < 32; j++) gname[g][j] = fn[j];
         gtype[g] = rtype;
-        int size = rtype == LONG ? 8 : 4;
+        int size = size_of(rtype);
         if (eat("=")) {                                 /* a starting value has to be a plain constant */
             ws();
             int neg = eat("-");
@@ -724,6 +870,7 @@ static void toplevel(void) {
             int lt;
             u64 v = literal(&lt);
             if (neg) v = -v;
+            if (is_ptr(rtype) && v) die("a pointer can only start as 0", 0);
             while (nd % size) data[nd++] = 0;           /* keep it aligned */
             goff[g] = nd; gbss[g] = 0;
             for (int k = 0; k < size; k++) data[nd++] = v >> (8 * k);
@@ -742,8 +889,8 @@ static void toplevel(void) {
     else if (!eat(")")) {
         do {
             if (n == 12) die("too many parameters", 0);
-            if (eat("int")) ptype[n] = INT; else if (eat("long")) ptype[n] = LONG;
-            else die("expected a parameter type", 0);
+            ptype[n] = type_name();
+            if (ptype[n] <= VOID) die("expected a parameter type", 0);
             ws();
             if (isw(*p)) { ident(); for (int j = 0; j < 32; j++) pname[n][j] = name[j]; }
             else pname[n][0] = 0;
